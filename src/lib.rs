@@ -12,9 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Spike 0 for rustfs/backlog#894 (P2 io_uring read backend).
+//! Cancel-safe async io_uring read backend for RustFS
+//! (rustfs/backlog#894, hardened per the #1048/#1051 audit).
 //!
-//! Proves the cancel-safety ownership model before any production work:
+//! This crate proves and enforces the ownership model any production io_uring
+//! integration in RustFS must follow:
 //!
 //! - The read buffer and the file handle are owned by the driver's pending
 //!   (orphan) table from SQE submission until the CQE arrives. The kernel may
@@ -24,11 +26,12 @@
 //!   touches the buffer. Optionally it submits `IORING_OP_ASYNC_CANCEL` to
 //!   accelerate the CQE; reclamation still happens only at the CQE.
 //! - Driver shutdown cancels all in-flight ops and drains the ring to
-//!   `in_flight == 0` before the ring is dropped (unmapped).
+//!   `in_flight == 0` (with a bounded escape hatch) before the ring is
+//!   unmapped.
 //!
-//! NOT production code: the driver thread uses a coarse poll loop instead of
-//! eventfd + `AsyncFd` reaping, there is no SQ-depth semaphore backpressure,
-//! no O_DIRECT alignment, and only one read shape. See SPIKE.md.
+//! Status: read path only. Still to come for full production use — eventfd +
+//! `AsyncFd` reaping (replacing the poll loop), O_DIRECT alignment,
+//! `LocalIoBackend` integration, and the write path. See `docs/DESIGN.md`.
 
 #[cfg(target_os = "linux")]
 mod driver;

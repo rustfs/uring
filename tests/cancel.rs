@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Cancel-safety acceptance tests for backlog#894 Spike 0.
+//! Cancel-safety acceptance tests for the rustfs-uring read backend
+//! (rustfs/backlog#894, #1048/#1051).
 //!
 //! In a restricted environment (Docker default seccomp, gVisor) the probe
 //! fails with an expected-restriction errno and every test degrades to a
@@ -27,7 +28,7 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use io_uring_cancel_spike::UringDriver;
+use rustfs_uring::UringDriver;
 
 fn driver_or_skip(name: &str) -> Option<UringDriver> {
     match UringDriver::probe_and_start(64) {
