@@ -1,4 +1,6 @@
 {
+  "_copyright": "Copyright 2024 RustFS Team",
+  "_license": "Apache-2.0 (http://www.apache.org/licenses/LICENSE-2.0)",
   "comment": "Deterministically block io_uring for run-docker.sh leg 1 (rustfs/backlog#1067): io_uring_setup/enter/register return EPERM, so the probe fails with an expected-restriction errno and the suite must degrade to a graceful skip — reproducing the #4313 restricted environment without depending on the host Docker's default seccomp.",
   "defaultAction": "SCMP_ACT_ALLOW",
   "syscalls": [
