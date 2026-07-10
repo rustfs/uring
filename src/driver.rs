@@ -50,6 +50,32 @@ const CURRENT_POSITION: u64 = u64::MAX;
 /// rustfs/backlog#1057); P2 must chunk reads larger than this.
 const MAX_READ_LEN: usize = 0x7fff_f000;
 
+/// Block-aligned superset geometry for a read (rustfs/backlog#1102).
+///
+/// Returns `(kernel_offset, head, region_len)`: the offset handed to the kernel,
+/// how many bytes of the read region precede the caller's logical range, and how
+/// many bytes the kernel is asked to read. `align == 1` is the buffered case and
+/// passes `offset` (which may be `CURRENT_POSITION`) straight through.
+///
+/// `None` when `align` is not a power of two or the aligned range would overflow.
+fn aligned_geometry(offset: u64, len: usize, align: usize) -> Option<(u64, usize, usize)> {
+    // A real device block is tiny (512..=4096). Capping alignment at the read
+    // cap keeps `align_offset(align)` always satisfiable (so it never returns
+    // `usize::MAX`, which would make the driver's later `ptr::add(pad)` UB) and
+    // keeps the `region_len + align - 1` allocation from overflowing `usize`.
+    if align == 0 || !align.is_power_of_two() || align > MAX_READ_LEN {
+        return None;
+    }
+    if align == 1 {
+        return Some((offset, 0, len));
+    }
+    let mask = align as u64 - 1;
+    let kernel_offset = offset & !mask;
+    let head = usize::try_from(offset - kernel_offset).ok()?;
+    let region_len = head.checked_add(len)?.checked_next_multiple_of(align)?;
+    Some((kernel_offset, head, region_len))
+}
+
 /// Heartbeat bound on the driver loop's blocking wait (backlog#1102). The loop
 /// normally wakes on a CQE (the ring's registered eventfd) or a new message
 /// (the wakeup eventfd); this timeout only bounds the wait so the bounded-drain
@@ -254,6 +280,11 @@ enum Msg {
         /// (rustfs/backlog#1060/#1102). If the driver rejects the op (shutting
         /// down) the permit is dropped with the message — released immediately.
         permit: OwnedSemaphorePermit,
+        /// Block size the read must be aligned to. `1` means a normal buffered
+        /// read; `> 1` means the file was opened `O_DIRECT` and the driver must
+        /// read the block-aligned superset range into a block-aligned buffer
+        /// (rustfs/backlog#1102).
+        align: usize,
     },
     Cancel {
         id: u64,
@@ -284,13 +315,33 @@ enum Msg {
 ///   property of the type: the permit is dropped exactly when this entry is
 ///   removed at the final CQE. A short-read resubmit keeps the entry, and thus
 ///   the permit, so in-flight memory stays bounded.
+/// - Alignment geometry (rustfs/backlog#1102). For a buffered read these are
+///   `pad = head = 0`, `align = 1`, `region_len = want`, so every rule below
+///   collapses to the plain case. For an `O_DIRECT` read the driver reads the
+///   block-aligned superset `[offset, offset + region_len)` into
+///   `buf[pad .. pad + region_len]` (both block-aligned) and hands the caller
+///   only `buf[pad + head .. pad + head + want]` — alignment padding never
+///   escapes.
 struct Pending {
     buf: Vec<u8>,
     file: Arc<File>,
     done: Option<oneshot::Sender<io::Result<Vec<u8>>>>,
+    /// Kernel read offset: the block-aligned offset for a direct read, the
+    /// logical offset for a buffered one, `CURRENT_POSITION` for a stream.
     offset: u64,
+    /// Bytes already read into the read region (`buf[pad..]`).
     nread: usize,
     _permit: OwnedSemaphorePermit,
+    /// Offset inside `buf` where the block-aligned read region starts.
+    pad: usize,
+    /// Bytes of the read region that precede the caller's logical range.
+    head: usize,
+    /// Logical length the caller asked for.
+    want: usize,
+    /// Bytes the kernel is asked to read (block-aligned for a direct read).
+    region_len: usize,
+    /// `1` for buffered, the block size for `O_DIRECT`.
+    align: usize,
 }
 
 /// Where a [`ReadHandle`] is in its lifecycle (rustfs/backlog#1102).
@@ -307,6 +358,7 @@ enum HandleState {
         file: Arc<File>,
         offset: u64,
         len: usize,
+        align: usize,
         done: oneshot::Sender<io::Result<Vec<u8>>>,
         wake: Arc<EventFd>,
     },
@@ -369,6 +421,7 @@ impl Future for ReadHandle {
                 file,
                 offset,
                 len,
+                align,
                 done,
                 wake,
                 ..
@@ -385,6 +438,7 @@ impl Future for ReadHandle {
                     len,
                     done,
                     permit,
+                    align,
                 })
                 .is_err()
             {
@@ -486,18 +540,34 @@ impl UringDriver {
         })
     }
 
-    /// Positioned read (pread semantics) — regular files.
+    /// Positioned read (pread semantics) — regular files, buffered.
     pub fn read_at(&self, file: Arc<File>, offset: u64, len: usize) -> ReadHandle {
         assert_ne!(offset, CURRENT_POSITION, "offset u64::MAX is reserved");
-        self.submit(file, offset, len)
+        self.submit(file, offset, len, 1)
     }
 
     /// Read at the file's current position (read(2) semantics) — pipes.
     pub fn read_current(&self, file: Arc<File>, len: usize) -> ReadHandle {
-        self.submit(file, CURRENT_POSITION, len)
+        self.submit(file, CURRENT_POSITION, len, 1)
     }
 
-    fn submit(&self, file: Arc<File>, offset: u64, len: usize) -> ReadHandle {
+    /// Positioned read from a file opened with `O_DIRECT` (rustfs/backlog#1102).
+    ///
+    /// `align` is the device's logical block size — a power of two, typically
+    /// 512 or 4096. `offset` and `len` are the caller's *logical* range and need
+    /// no alignment: the driver reads the block-aligned superset range into a
+    /// block-aligned buffer and returns exactly `[offset, offset + len)`.
+    /// Alignment padding never reaches the caller, so a `BitrotReader` expecting
+    /// an exact shard length never sees padded output.
+    ///
+    /// The caller must have opened `file` with `O_DIRECT`; otherwise this is
+    /// just a (correct but pointless) buffered read of the superset range.
+    pub fn read_at_direct(&self, file: Arc<File>, offset: u64, len: usize, align: usize) -> ReadHandle {
+        assert_ne!(offset, CURRENT_POSITION, "offset u64::MAX is reserved");
+        self.submit(file, offset, len, align)
+    }
+
+    fn submit(&self, file: Arc<File>, offset: u64, len: usize, align: usize) -> ReadHandle {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         assert_eq!(id & CANCEL_BIT, 0, "op id overflowed into the cancel bit");
         let (done, rx) = oneshot::channel();
@@ -545,6 +615,27 @@ impl UringDriver {
             };
         }
 
+        // Reject a bad O_DIRECT alignment, and a request whose block-aligned
+        // superset range would exceed the kernel's single-read cap
+        // (rustfs/backlog#1102). `align == 1` (buffered) always passes.
+        match aligned_geometry(offset, len, align) {
+            Some((_, _, region_len)) if region_len <= MAX_READ_LEN => {}
+            _ => {
+                let _ = done.send(Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "alignment must be a power of two and the block-aligned range must fit MAX_RW_COUNT",
+                )));
+                return ReadHandle {
+                    id,
+                    rx,
+                    tx: self.tx.clone(),
+                    finished: false,
+                    cancel_on_drop: false,
+                    state: HandleState::Inert,
+                };
+            }
+        }
+
         // Take a backpressure permit BEFORE the op reaches the driver; it is
         // released only when the pending entry is dropped at the CQE (C10,
         // rustfs/backlog#1060). Acquisition never blocks the caller's thread
@@ -561,6 +652,7 @@ impl UringDriver {
                     len,
                     done,
                     permit,
+                    align,
                 }) {
                     // Driver gone: the op never reached it. Surface an explicit
                     // driver-gone error through `done` instead of letting the
@@ -604,6 +696,7 @@ impl UringDriver {
                     file,
                     offset,
                     len,
+                    align,
                     done,
                     wake: Arc::clone(&self.wake_efd),
                 },
@@ -832,6 +925,28 @@ impl Drop for DriverState {
     }
 }
 
+/// Hand the caller exactly the logical range `[head, head + want)` of the read
+/// region, truncated to what was actually read (rustfs/backlog#1102).
+///
+/// Alignment padding (`buf[..pad]`), the bytes before the logical range
+/// (`head`), and the block-aligned tail after it never reach the caller — a
+/// `BitrotReader` expecting an exact shard length would flag padded output as
+/// corruption. Only bytes the kernel actually wrote are exposed: `avail` is
+/// clamped to `nread`, so the zero-filled remainder of the buffer stays hidden
+/// (content hygiene, C12 / rustfs/backlog#1062).
+fn deliver(p: &mut Pending) -> Vec<u8> {
+    let avail = p.nread.saturating_sub(p.head).min(p.want);
+    let start = p.pad + p.head;
+    // The buffered path (`align == 1`) has `pad == 0` and `head == 0`, so the
+    // logical range already starts at byte 0 — skip the full-buffer memmove and
+    // just truncate. Only the O_DIRECT path (nonzero start) needs the shift.
+    if start != 0 && avail != 0 {
+        p.buf.copy_within(start..start + avail, 0);
+    }
+    p.buf.truncate(avail);
+    std::mem::take(&mut p.buf)
+}
+
 /// What to do with a pending entry after its CQE (C9, rustfs/backlog#1058).
 enum ReapStep {
     /// The logical read is done: remove the entry and deliver this result.
@@ -886,6 +1001,7 @@ fn drive(
                     len,
                     done,
                     permit,
+                    align,
                 } => {
                     if shutting_down {
                         let _ = done.send(Err(io::Error::other("uring driver shutting down")));
@@ -894,13 +1010,46 @@ fn drive(
                         drop(permit);
                         continue;
                     }
-                    let mut buf = vec![0u8; len];
+                    // `submit` already validated this geometry.
+                    let (kernel_offset, head, region_len) =
+                        aligned_geometry(offset, len, align).expect("submit validated the geometry");
+                    // For an O_DIRECT read the kernel needs a block-aligned
+                    // buffer, so over-allocate by `align - 1` and start the read
+                    // region at the first aligned byte inside the allocation.
+                    // For a buffered read this degenerates to `vec![0u8; len]`.
+                    // `submit` already capped `align <= MAX_READ_LEN` and
+                    // `region_len <= MAX_READ_LEN`, so this add cannot overflow;
+                    // the checked form keeps the invariant explicit rather than
+                    // relying on it silently.
+                    let cap = match region_len.checked_add(align - 1) {
+                        Some(cap) => cap,
+                        None => {
+                            let _ = done.send(Err(io::Error::other("aligned O_DIRECT allocation size overflow")));
+                            drop(permit);
+                            continue;
+                        }
+                    };
+                    let mut buf = vec![0u8; cap];
+                    let pad = buf.as_ptr().align_offset(align);
+                    // Runtime guard (not a debug-only assert): if the allocator
+                    // ever returned a block `align_offset` cannot satisfy, refuse
+                    // the read instead of doing UB pointer arithmetic below.
+                    if pad == usize::MAX || pad.checked_add(region_len).is_none_or(|end| end > buf.len()) {
+                        let _ = done.send(Err(io::Error::other("could not align O_DIRECT read buffer")));
+                        drop(permit);
+                        continue;
+                    }
+
                     // The raw pointer is captured before `buf` moves into the
-                    // table; moving the Vec never relocates its heap block,
-                    // and the entry is only removed at the CQE. `len as u32`
+                    // table; moving the Vec never relocates its heap block, and
+                    // the entry is only removed at the CQE. `region_len as u32`
                     // is lossless: `submit` rejected anything > MAX_READ_LEN.
-                    let sqe = opcode::Read::new(types::Fd(file.as_raw_fd()), buf.as_mut_ptr(), len as u32)
-                        .offset(offset)
+                    //
+                    // SAFETY: `pad <= align - 1` and `pad + region_len <=
+                    // buf.len()`, so the pointer stays inside the allocation.
+                    let region_ptr = unsafe { buf.as_mut_ptr().add(pad) };
+                    let sqe = opcode::Read::new(types::Fd(file.as_raw_fd()), region_ptr, region_len as u32)
+                        .offset(kernel_offset)
                         .build()
                         .user_data(id);
                     state.pending.insert(
@@ -909,11 +1058,16 @@ fn drive(
                             buf,
                             file,
                             done: Some(done),
-                            offset,
+                            offset: kernel_offset,
                             nread: 0,
                             // Released exactly when this entry is removed at the
                             // final CQE — never at future drop (backlog#1060).
                             _permit: permit,
+                            pad,
+                            head,
+                            want: len,
+                            region_len,
+                            align,
                         },
                     );
                     stats.submitted.fetch_add(1, Ordering::SeqCst);
@@ -996,34 +1150,35 @@ fn drive(
                     // Error (incl. ECANCELED) terminates the logical read.
                     ReapStep::Finish(Err(io::Error::from_raw_os_error(-res)))
                 } else if res == 0 {
-                    // Real EOF: deliver what was read so far.
-                    p.buf.truncate(p.nread);
-                    ReapStep::Finish(Ok(std::mem::take(&mut p.buf)))
+                    // Real EOF: deliver whatever of the logical range was read.
+                    ReapStep::Finish(Ok(deliver(p)))
                 } else {
                     p.nread += res as usize;
-                    // Only POSITIONED reads (read_at, whole-range pread
-                    // contract) resubmit a short read. CURRENT_POSITION reads
-                    // (read_current on pipes/streams) follow read(2) semantics:
-                    // a short read is a valid final result and must be
-                    // delivered as-is — resubmitting would block forever
-                    // waiting for stream data that may never come.
+                    // Only POSITIONED reads (read_at / read_at_direct, whole-range
+                    // pread contract) resubmit a short read. CURRENT_POSITION
+                    // reads (read_current on pipes/streams) follow read(2)
+                    // semantics: a short read is a valid final result and must be
+                    // delivered as-is — resubmitting would block forever waiting
+                    // for stream data that may never come.
                     let is_stream = p.offset == CURRENT_POSITION;
-                    if is_stream || p.nread >= p.buf.len() {
-                        p.buf.truncate(p.nread);
-                        ReapStep::Finish(Ok(std::mem::take(&mut p.buf)))
+                    let covered = p.nread >= p.head + p.want;
+                    // An O_DIRECT resubmit must stay block-aligned. The kernel
+                    // returns block multiples except at the file tail, so a
+                    // non-multiple means we reached EOF: stop and deliver.
+                    let unaligned_tail = p.align > 1 && !p.nread.is_multiple_of(p.align);
+                    if is_stream || covered || unaligned_tail || p.nread >= p.region_len {
+                        ReapStep::Finish(Ok(deliver(p)))
                     } else {
-                        // Positioned short read, not EOF: resubmit the
-                        // remainder into buf[nread..]. The buffer stays owned by
-                        // the driver and in_flight is unchanged — one logical op.
-                        let remaining = p.buf.len() - p.nread;
-                        // SAFETY: buf[nread..] is in bounds (nread < len) and
-                        // stays alive in the pending table until the CQE.
-                        let ptr = unsafe { p.buf.as_mut_ptr().add(p.nread) };
-                        let next_off = if p.offset == CURRENT_POSITION {
-                            CURRENT_POSITION
-                        } else {
-                            p.offset + p.nread as u64
-                        };
+                        // Positioned short read, not EOF: resubmit the remainder
+                        // into the read region. The buffer stays owned by the
+                        // driver and in_flight is unchanged — one logical op.
+                        // For a direct read, `pad + nread` and `offset + nread`
+                        // are both block-aligned, as is `remaining`.
+                        let remaining = p.region_len - p.nread;
+                        // SAFETY: `pad + nread < pad + region_len <= buf.len()`,
+                        // and the buffer lives in the pending table until the CQE.
+                        let ptr = unsafe { p.buf.as_mut_ptr().add(p.pad + p.nread) };
+                        let next_off = p.offset + p.nread as u64;
                         let sqe = opcode::Read::new(types::Fd(p.file.as_raw_fd()), ptr, remaining as u32)
                             .offset(next_off)
                             .build()

@@ -82,7 +82,8 @@ future drop(任意时刻)                                        │
 
 - **[已部分整改 rustfs/backlog#1102]** 200µs 忙轮询已由 eventfd 唤醒替换:一个 eventfd 注册到 ring(内核每 CQE 信号)、一个由 `submit`/shutdown 信号,驱动线程 `poll` 两者阻塞等待,`submit()` 每轮仍冲刷 NODROP overflow list。**剩余**:tokio `AsyncFd` 收割(去掉专用驱动线程、把收割并入 tokio reactor)——需下放提交侧,是更大的重构。
 - 进程级单例 ring 的生命周期管理(本 spike 每测试一个 ring);Drop 路径不得无界阻塞 tokio worker。
-- O_DIRECT 对齐 buffer(P1 的 statx 探测复用)、三条读形态接入 `LocalIoBackend`。
+- **[已整改 rustfs/backlog#1102]** O_DIRECT 对齐读:`read_at_direct(file, offset, len, align)`。驱动读**块对齐超范围**到**块对齐 buffer**(超额分配 `align-1` 字节,在分配内部取第一个对齐字节作为读区起点),完成后只把逻辑区间 `[offset, offset+len)` 切出交给调用方——**对齐填充、区间前缀、块对齐尾部一律不外泄**(否则 `BitrotReader` 会把补齐字节当损坏)。短读 resubmit 保持块对齐;内核返回非块倍数即文件尾,停止并交付。缓冲读是 `align == 1` 的退化情形,几何完全一致。**剩余**:调用方(ecstore)以 O_DIRECT 打开 fd 并接线(见 rustfs/rustfs#4645 的临时分流)。
+- 三条读形态接入 `LocalIoBackend`。
 - per-disk 探测缓存与运行期 errno 降级闩锁(参照 main 上 `DirectIoReadState`,`crates/ecstore/src/disk/local.rs`;运行期 errno 分类须按不变量补充里的三分类,勿复用 probe 期分类)。
 - registered buffers(P3,内容卫生见不变量 8 / rustfs/backlog#1062)/写路径(P4)完全不涉及。
 
