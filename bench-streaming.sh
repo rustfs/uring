@@ -24,6 +24,11 @@
 # Emits one CSV to stdout. Cold mode needs root (drop_caches); the bench host
 # azure-20780104 runs as root. REPEAT>1 runs each config N times so the caller
 # can take the median.
+#
+# BENCH_DIR only ever holds files this script created: the example refuses to
+# truncate, overwrite, or follow a symlink at an existing path, so a mistyped
+# BENCH_DIR fails loudly instead of destroying data even though the sweep runs
+# as root.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -31,6 +36,7 @@ DIR="${BENCH_DIR:-/data/rustfs/uring-bench}"
 REPEAT="${REPEAT:-3}"
 ALIGN="${ALIGN:-4096}"
 BIN="${CARGO_TARGET_DIR:-target}/release/examples/streaming_bench"
+STRATEGIES=(std_buffered std_odirect uring_read_at uring_read_at_direct)
 
 # Sizes: metadata-ish, mid object, large object.
 SIZES=(${SIZES:-65536 16777216 268435456})
@@ -39,6 +45,32 @@ QDS=(${QDS:-1 4 16})
 
 mkdir -p "$DIR"
 cargo build --release --example streaming_bench >&2
+
+# Correctness preflight (untimed; its output is discarded). Throughput cannot
+# distinguish a strategy that reads the right *number* of bytes from one that
+# reads the wrong offsets or repeats a chunk, so every strategy first replays
+# the boundary geometries under BENCH_VERIFY=1, which checks each delivered byte
+# against the file's offset-addressable pattern:
+#   - a size that is a block multiple but not a chunk multiple (partial tail);
+#   - a size that is neither (O_DIRECT tail inside a partially valid block);
+#   - queue depths 1 and 4, covering the pipelined path's offset bookkeeping.
+# A mismatch aborts the script before any measurement is taken.
+preflight_verify() {
+    local vdir="$DIR/verify.$$" chunk=131072 size strat qd
+    rm -rf "$vdir"
+    mkdir -p "$vdir"
+    # shellcheck disable=SC2064
+    trap "rm -rf '$vdir'" RETURN
+    for size in $((1048576 + 4096)) $((1048576 + 4097)); do
+        for strat in "${STRATEGIES[@]}"; do
+            for qd in 1 4; do
+                BENCH_VERIFY=1 "$BIN" "$strat" "$vdir/verify_${size}.bin" "$size" "$chunk" "$qd" "$ALIGN" >/dev/null
+            done
+        done
+    done
+    echo "preflight: all strategies verified byte-exact" >&2
+}
+preflight_verify
 
 # Pre-create every file once (untimed) so cold runs are genuinely cold: the
 # example's ensure_file becomes a no-op and the runner's drop_caches is the only
