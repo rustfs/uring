@@ -110,14 +110,16 @@ struct Config {
     read_size: usize,
     concurrency: usize,
     total_ops: usize,
+    shards: usize,
     verify: bool,
 }
 
 fn parse_args() -> Result<Config, String> {
     let a: Vec<String> = std::env::args().collect();
-    if a.len() != 7 {
+    if a.len() != 7 && a.len() != 8 {
         return Err(
-            "usage: concurrent_pread_bench <strategy> <file> <file_size> <read_size> <concurrency> <total_ops>".to_string(),
+            "usage: concurrent_pread_bench <strategy> <file> <file_size> <read_size> <concurrency> <total_ops> [shards]"
+                .to_string(),
         );
     }
     let parse = |name: &str, raw: &str| -> Result<u64, String> {
@@ -131,6 +133,7 @@ fn parse_args() -> Result<Config, String> {
         read_size: parse("read_size", &a[4])? as usize,
         concurrency: parse("concurrency", &a[5])? as usize,
         total_ops: parse("total_ops", &a[6])? as usize,
+        shards: if a.len() == 8 { parse("shards", &a[7])? as usize } else { 1 },
         verify: matches!(std::env::var("BENCH_VERIFY").as_deref(), Ok("1") | Ok("true")),
     };
     validate(&cfg)?;
@@ -291,7 +294,7 @@ async fn run(cfg: &Config) -> Result<Vec<Duration>, String> {
     let driver = if cfg.strategy.uses_uring() {
         let depth = (cfg.concurrency.max(64) * 2).next_power_of_two() as u32;
         Some(Arc::new(
-            UringDriver::probe_and_start(depth).map_err(|e| format!("probe io_uring: {e:?}"))?,
+            UringDriver::probe_and_start_sharded(depth, cfg.shards).map_err(|e| format!("probe io_uring: {e:?}"))?,
         ))
     } else {
         None
@@ -416,10 +419,11 @@ fn main() -> ExitCode {
     let ops = lats.len();
     let iops = ops as f64 / secs;
     let mbps = (ops as f64 * cfg.read_size as f64 / (1024.0 * 1024.0)) / secs;
-    // CSV: strategy,file_size,read_size,concurrency,ops,secs,IOPS,MBps,p50_us,p99_us,p999_us
+    // CSV: strategy,shards,file_size,read_size,concurrency,ops,secs,IOPS,MBps,p50_us,p99_us,p999_us
     println!(
-        "{},{},{},{},{},{:.6},{:.0},{:.1},{},{},{}",
+        "{},{},{},{},{},{},{:.6},{:.0},{:.1},{},{},{}",
         cfg.strategy.name(),
+        cfg.shards,
         cfg.file_size,
         cfg.read_size,
         cfg.concurrency,
