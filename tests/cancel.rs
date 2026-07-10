@@ -452,6 +452,79 @@ async fn pipe_half_close_reads_eof() {
     driver.shutdown();
 }
 
+/// Open `path` read-only with `O_DIRECT`. `None` when the filesystem refuses it
+/// (tmpfs, some overlay/network mounts), which is a legitimate configuration.
+fn open_direct(path: &std::path::Path) -> Option<Arc<File>> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `c_path` is a valid NUL-terminated path; on success we own the fd.
+    let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_DIRECT | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return None;
+    }
+    Some(Arc::new(unsafe { File::from_raw_fd(fd) }))
+}
+
+/// O_DIRECT positioned read (rustfs/backlog#1102): the driver reads the
+/// block-aligned superset range into a block-aligned buffer and hands back
+/// exactly the requested logical range. Alignment padding, the bytes before the
+/// range, and the block-aligned tail must never escape — a BitrotReader
+/// expecting an exact shard length would flag padded output as corruption.
+#[tokio::test(flavor = "multi_thread")]
+async fn direct_read_returns_exact_unaligned_ranges() {
+    let Some(driver) = driver_or_skip("direct_read_returns_exact_unaligned_ranges") else {
+        return;
+    };
+
+    const ALIGN: usize = 4096;
+    const FILE_LEN: usize = ALIGN * 3 + 7; // deliberately not block-aligned
+    let content = make_content(FILE_LEN);
+
+    let path = std::env::temp_dir().join(format!("uring-odirect-{}", std::process::id()));
+    {
+        let mut f = File::create(&path).expect("create temp file");
+        f.write_all(&content).expect("write temp file");
+        // O_DIRECT bypasses the page cache; make sure the data is on the device.
+        f.sync_all().expect("sync temp file");
+    }
+
+    let Some(file) = open_direct(&path) else {
+        // Not a skip of the io_uring paths — the suite still exercised them —
+        // only the O_DIRECT assertions cannot run on this filesystem.
+        eprintln!("direct_read_returns_exact_unaligned_ranges: filesystem rejects O_DIRECT, assertions not exercised");
+        driver.shutdown();
+        let _ = std::fs::remove_file(&path);
+        return;
+    };
+
+    // Unaligned starts, block-straddling ranges, and the unaligned file tail.
+    let ranges = [
+        (0usize, FILE_LEN),
+        (0, ALIGN),
+        (1, 17),
+        (ALIGN - 1, ALIGN + 2),
+        (ALIGN * 2, ALIGN + 7),
+        (FILE_LEN - 7, 7),
+    ];
+    for (offset, len) in ranges {
+        let got = driver
+            .read_at_direct(Arc::clone(&file), offset as u64, len, ALIGN)
+            .await
+            .expect("O_DIRECT read failed");
+        assert_eq!(got, &content[offset..offset + len], "O_DIRECT read mismatch at offset={offset} len={len}");
+    }
+
+    // A non-power-of-two alignment is rejected before the kernel sees it.
+    let err = driver
+        .read_at_direct(Arc::clone(&file), 0, 16, 3)
+        .await
+        .expect_err("non-power-of-two alignment must be rejected");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "unexpected error: {err:?}");
+
+    driver.shutdown();
+    let _ = std::fs::remove_file(&path);
+}
+
 /// Async backpressure (rustfs/backlog#1102): once every permit is held, `submit`
 /// must NOT park the caller's thread. It returns a handle that has not submitted
 /// anything; the permit is acquired — and the op submitted — on the handle's
