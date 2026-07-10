@@ -20,7 +20,7 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError, TryRecvError};
+use std::sync::mpsc::{self, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Context, Poll};
 use std::thread::JoinHandle;
@@ -49,6 +49,85 @@ const CURRENT_POSITION: u64 = u64::MAX;
 /// truncation can never silently turn a huge read into a 0-byte "EOF" (C6,
 /// rustfs/backlog#1057); P2 must chunk reads larger than this.
 const MAX_READ_LEN: usize = 0x7fff_f000;
+
+/// Heartbeat bound on the driver loop's blocking wait (backlog#1102). The loop
+/// normally wakes on a CQE (the ring's registered eventfd) or a new message
+/// (the wakeup eventfd); this timeout only bounds the wait so the bounded-drain
+/// deadline is still checked and any queued cancel is picked up promptly.
+const LOOP_HEARTBEAT: Duration = Duration::from_millis(50);
+
+/// Owned `eventfd(2)` used to wake the driver loop (backlog#1102): one is
+/// registered with the ring so the kernel signals it on every CQE, the other is
+/// signaled by `submit`/shutdown so a new message wakes the loop immediately —
+/// together they replace the spike's 200 µs busy-poll.
+struct EventFd {
+    fd: std::os::fd::RawFd,
+}
+
+impl EventFd {
+    fn new() -> io::Result<Self> {
+        // SAFETY: eventfd returns a fresh owned fd or -1; the flags are valid.
+        let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self { fd })
+    }
+
+    fn as_raw(&self) -> std::os::fd::RawFd {
+        self.fd
+    }
+
+    /// Make the fd readable. A saturated counter (EAGAIN) is fine — it is
+    /// already readable, which is all a wakeup needs.
+    fn signal(&self) {
+        let v: u64 = 1;
+        // SAFETY: writing 8 bytes from a valid u64 to an eventfd we own.
+        unsafe {
+            libc::write(self.fd, (&v as *const u64).cast(), 8);
+        }
+    }
+
+    /// Reset the counter. EFD_NONBLOCK guarantees this never blocks; a single
+    /// successful read drains the whole counter, the next returns EAGAIN.
+    fn drain(&self) {
+        let mut v: u64 = 0;
+        // SAFETY: reading 8 bytes into a valid u64 from an eventfd we own.
+        while unsafe { libc::read(self.fd, (&mut v as *mut u64).cast(), 8) } == 8 {}
+    }
+}
+
+impl Drop for EventFd {
+    fn drop(&mut self) {
+        // SAFETY: we own this fd and drop it exactly once.
+        unsafe {
+            libc::close(self.fd);
+        }
+    }
+}
+
+/// Block until a CQE is ready (`cq`), a new message arrives (`wake`), or the
+/// heartbeat elapses. The return value is ignored: a spurious wakeup, timeout,
+/// or EINTR just runs one loop turn (intake + reap), which is always safe.
+fn wait_for_events(cq: &EventFd, wake: &EventFd, timeout: Duration) {
+    let mut fds = [
+        libc::pollfd {
+            fd: cq.as_raw(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: wake.as_raw(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    let ms = timeout.as_millis().min(i32::MAX as u128) as libc::c_int;
+    // SAFETY: `fds` is a valid, initialized array of two pollfds.
+    unsafe {
+        libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, ms);
+    }
+}
 
 /// Why the probe refused to start the io_uring driver.
 ///
@@ -295,6 +374,9 @@ pub struct UringDriver {
     stats: Arc<DriverStats>,
     next_id: AtomicU64,
     bp: Arc<Backpressure>,
+    /// Signaled after every message send so the driver loop wakes immediately
+    /// instead of waiting out the heartbeat (backlog#1102).
+    wake_efd: Arc<EventFd>,
 }
 
 impl UringDriver {
@@ -313,6 +395,18 @@ impl UringDriver {
         }
         probe_real_read(&mut ring).map_err(ProbeFailure::ReadOp)?;
 
+        // Wake the driver loop on CQEs (kernel-signaled via a registered
+        // eventfd) and on new messages (submit-signaled), replacing the 200 µs
+        // busy-poll (backlog#1102). Registration needs the ring, which the
+        // driver thread then owns; `cq_efd` is moved in alongside so it outlives
+        // the ring (dropped after it, unregistering cleanly).
+        let cq_efd = EventFd::new().map_err(ProbeFailure::Setup)?;
+        ring.submitter()
+            .register_eventfd(cq_efd.as_raw())
+            .map_err(ProbeFailure::Setup)?;
+        let wake_efd = Arc::new(EventFd::new().map_err(ProbeFailure::Setup)?);
+        let thread_wake = Arc::clone(&wake_efd);
+
         let (tx, rx) = mpsc::channel();
         let stats = Arc::new(DriverStats::default());
         let thread_stats = Arc::clone(&stats);
@@ -322,7 +416,7 @@ impl UringDriver {
         let thread_bp = Arc::clone(&bp);
         let handle = std::thread::Builder::new()
             .name("uring-spike-driver".into())
-            .spawn(move || drive(ring, rx, thread_stats, thread_bp))
+            .spawn(move || drive(ring, rx, thread_stats, thread_bp, cq_efd, thread_wake))
             .expect("spawn driver thread");
 
         Ok(Self {
@@ -331,6 +425,7 @@ impl UringDriver {
             stats,
             next_id: AtomicU64::new(1),
             bp,
+            wake_efd,
         })
     }
 
@@ -429,6 +524,8 @@ impl UringDriver {
                 cancel_on_drop: false,
             };
         }
+        // Wake the driver loop so the read starts immediately (backlog#1102).
+        self.wake_efd.signal();
         ReadHandle {
             id,
             rx,
@@ -456,6 +553,7 @@ impl UringDriver {
     /// ring dropped/unmapped — the shutdown ordering P2 requires.
     pub fn shutdown(mut self) -> StatsSnapshot {
         let _ = self.tx.send(Msg::Shutdown);
+        self.wake_efd.signal();
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
@@ -479,6 +577,7 @@ impl Drop for UringDriver {
     fn drop(&mut self) {
         if let Some(h) = self.handle.take() {
             let _ = self.tx.send(Msg::Shutdown);
+            self.wake_efd.signal();
             let _ = h.join();
         }
     }
@@ -653,7 +752,14 @@ enum ReapStep {
     Resubmit(io_uring::squeue::Entry),
 }
 
-fn drive(ring: IoUring, rx: mpsc::Receiver<Msg>, stats: Arc<DriverStats>, bp: Arc<Backpressure>) {
+fn drive(
+    ring: IoUring,
+    rx: mpsc::Receiver<Msg>,
+    stats: Arc<DriverStats>,
+    bp: Arc<Backpressure>,
+    cq_efd: EventFd,
+    wake_efd: Arc<EventFd>,
+) {
     let mut state = DriverState {
         ring,
         pending: HashMap::new(),
@@ -663,27 +769,25 @@ fn drive(ring: IoUring, rx: mpsc::Receiver<Msg>, stats: Arc<DriverStats>, bp: Ar
     let mut drain_deadline: Option<Instant> = None;
 
     loop {
-        // 1. Intake. Block (with timeout) only when fully idle; once ops are
-        //    in flight we must keep reaping, so only try_recv.
+        // Block until a CQE is ready (the ring's registered eventfd), a new
+        // message arrives (the wakeup eventfd), or the heartbeat elapses —
+        // this replaces the spike's 200 µs busy-poll (backlog#1102). Draining
+        // both eventfds after waking keeps them from staying spuriously
+        // readable; a missed edge is harmless because the CQ/mpsc are re-checked
+        // unconditionally below.
+        wait_for_events(&cq_efd, &wake_efd, LOOP_HEARTBEAT);
+        cq_efd.drain();
+        wake_efd.drain();
+
+        // 1. Intake: drain all queued messages (the wait above did the blocking,
+        //    so this is purely non-blocking).
         loop {
-            let idle = state.pending.is_empty() && state.backlog.is_empty() && !shutting_down;
-            let msg = if idle {
-                match rx.recv_timeout(Duration::from_millis(50)) {
-                    Ok(m) => m,
-                    Err(RecvTimeoutError::Timeout) => break,
-                    Err(RecvTimeoutError::Disconnected) => {
-                        shutting_down = true;
-                        break;
-                    }
-                }
-            } else {
-                match rx.try_recv() {
-                    Ok(m) => m,
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => {
-                        shutting_down = true;
-                        break;
-                    }
+            let msg = match rx.try_recv() {
+                Ok(m) => m,
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    shutting_down = true;
+                    break;
                 }
             };
             match msg {
@@ -895,11 +999,7 @@ fn drive(ring: IoUring, rx: mpsc::Receiver<Msg>, stats: Arc<DriverStats>, bp: Ar
                 return;
             }
         }
-
-        // Spike-grade pacing: production replaces this poll with eventfd +
-        // tokio AsyncFd reaping (backlog#894).
-        if !state.pending.is_empty() {
-            std::thread::sleep(Duration::from_micros(200));
-        }
+        // No pacing sleep: `wait_for_events` at the top of the loop blocks until
+        // the next CQE, message, or heartbeat (backlog#1102).
     }
 }
