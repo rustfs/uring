@@ -42,7 +42,9 @@ future drop(任意时刻)                                        │
 以下不变量是本次审计整改(rustfs/backlog#1051)新增/固化,P2 必须一并沿用:
 
 6. **驱动线程 unwind 安全**(rustfs/backlog#1054):驱动线程绝不允许在栈展开中释放 pending 表或 unmap ring——否则内核仍可能向在途 buffer 写入即 UAF。实现为 `DriverState::Drop` 检测 `thread::panicking()` 时在字段析构前 `process::abort()`(leak over UAF)。所有 caller 可控的 panic 面(如超大 `len`)在 `submit` 入口拒止。`catch_unwind` 不够——析构在展开时、catch 边界之前就已发生。
-7. **背压 permit 在 CQE 点释放**(rustfs/backlog#1060):in-flight 上界 ≤ CQ 容量(取 SQ 深度 `entries` < `2*entries`,使 CQ overflow 结构性不可达),permit 随 pending 表项移除(CQE)释放,**绝不随 future drop 释放**——否则 quorum 大量 drop future 会让 permit 计数与驻留内存脱钩,重开内存 DoS 面。
+7. **背压 permit 在 CQE 点释放**(rustfs/backlog#1060;异步化见 #1102):in-flight 上界 ≤ CQ 容量(取 SQ 深度 `entries` < `2*entries`,使 CQ overflow 结构性不可达),permit 随 pending 表项移除(CQE)释放,**绝不随 future drop 释放**——否则 quorum 大量 drop future 会让 permit 计数与驻留内存脱钩,重开内存 DoS 面。
+   - **已落地**:`tokio::sync::Semaphore`;`OwnedSemaphorePermit` 随 `Msg::Read` 存进 `Pending` 表项,表项在最终 CQE 被移除时 permit 自动 drop ——"CQE 点释放"由**类型系统强制**,不再依赖手写 `release()`(短读 resubmit 保留表项,故也保留 permit)。
+   - **获取从不阻塞线程**:未饱和走 `try_acquire_owned()` 快路径(无分配、无 await、提交仍是即时的);饱和时把 acquire future 交给返回的 `ReadHandle`,首次 poll 时 await 到 permit 再提交。因此**一个在首次 poll 前就被 drop 的 handle 从未提交、从未分配 buffer**(比阻塞实现更省内存),`delivered + orphan_reclaimed == submitted` 的守恒式仍恒成立。
 8. **复用缓冲内容卫生**(rustfs/backlog#1062,P3 前置):当前 spike 每 op 新分配零页 + `truncate(res)`,**无泄露**。P3 改用驱动自有对齐 slab(registered buffer)后,缓冲跨请求复用即脏内存——任何路径忘记按 `cqe.res` 截断/掩蔽(O_DIRECT 整块读再由上层切片、或错误路径把整块缓冲交还)就把上一租户请求的对象字节泄给当前请求(CWE-226)。不变量:**复用缓冲对调用方可见的字节严格 ⊆ `[0, cqe.res)`**,越界部分零化或由类型系统(返回带长度上限的 view 而非整块 slice)保证不可达。docs/DESIGN.md 与 #1048 原约束只讲 slab 生命周期(防 UAF),不讲内容卫生;需配套"脏缓冲 + 短读"回归测试。
 
 补充契约:

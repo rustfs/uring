@@ -219,16 +219,26 @@ async fn cancel_stress_accounts_for_every_buffer() {
     }
 
     let snap = driver.shutdown();
-    assert_eq!(snap.submitted, OPS as u64);
+    // `submitted == OPS` was an artifact of the old BLOCKING backpressure: the
+    // 65th read_at parked the caller's thread until a permit freed, so every op
+    // was submitted before its handle could be dropped. Under async backpressure
+    // (rustfs/backlog#1102) a handle dropped before its first poll never
+    // acquires a permit and therefore never submits — no buffer is allocated, so
+    // there is nothing to reclaim (strictly better for memory). Ops that did get
+    // an immediate permit are submitted eagerly and, when dropped, cancelled and
+    // orphan-reclaimed.
+    assert!(snap.submitted <= OPS as u64, "more ops submitted than requested: {snap:?}");
     // The exact split delivered == OPS/2 was flaky (C18, rustfs/backlog#1066):
     // an even-i read can finish between read_at returning and drop(handle),
     // delivering to the still-live receiver and flipping the split — all while
     // the ownership model behaves correctly. Only the conservation identity is
     // deterministic; the kept half guarantees delivered >= OPS/2.
     assert!(snap.delivered >= (OPS / 2) as u64, "kept half not all delivered: {snap:?}");
+    // THE invariant: every op the driver accepted is accounted for — delivered
+    // to a live caller or orphan-reclaimed at its CQE. No buffer is ever lost.
     assert_eq!(
         snap.delivered + snap.orphan_reclaimed,
-        OPS as u64,
+        snap.submitted,
         "some buffers are unaccounted for: {snap:?}"
     );
     let _ = std::fs::remove_file(path);
@@ -440,6 +450,69 @@ async fn pipe_half_close_reads_eof() {
     let got = handle.await.expect("pipe EOF read");
     assert!(got.is_empty(), "closed-pipe read should be empty EOF, got {}", got.len());
     driver.shutdown();
+}
+
+/// Async backpressure (rustfs/backlog#1102): once every permit is held, `submit`
+/// must NOT park the caller's thread. It returns a handle that has not submitted
+/// anything; the permit is acquired — and the op submitted — on the handle's
+/// first poll, after a permit frees.
+///
+/// With the old blocking backpressure this test would hang: the saturating reads
+/// are blocked pipe reads, so no permit can ever free while `read_at` parks.
+#[tokio::test(flavor = "multi_thread")]
+async fn saturated_submit_defers_instead_of_blocking() {
+    const DEPTH: u32 = 4;
+    let driver = match UringDriver::probe_and_start(DEPTH) {
+        Ok(d) => d,
+        Err(e) => {
+            assert!(
+                e.is_expected_restriction(),
+                "probe failed OUTSIDE the expected restriction errno class: {e:?}"
+            );
+            eprintln!("SKIP saturated_submit_defers_instead_of_blocking: restricted environment ({e:?})");
+            return;
+        }
+    };
+
+    let (pipe_read, mut pipe_write) = os_pipe();
+    const LEN: usize = 4096;
+    let content = make_content(LEN);
+    let (path, file) = temp_file_with(&content, "backpressure");
+
+    // Saturate: DEPTH blocked pipe reads hold every permit.
+    let mut held = Vec::new();
+    for _ in 0..DEPTH {
+        held.push(driver.read_current(Arc::clone(&pipe_read), 64));
+    }
+    assert!(
+        wait_until(Duration::from_secs(2), || driver.stats().in_flight == u64::from(DEPTH)).await,
+        "backpressure never saturated: {:?}",
+        driver.stats()
+    );
+
+    // Saturated. This call must return immediately (it would block forever under
+    // the old implementation) and must NOT have submitted anything.
+    let extra = driver.read_at(Arc::clone(&file), 0, LEN);
+    let snap = driver.stats();
+    assert_eq!(snap.in_flight, u64::from(DEPTH), "saturated submit put an op in flight: {snap:?}");
+    assert_eq!(snap.submitted, u64::from(DEPTH), "saturated submit submitted an op: {snap:?}");
+
+    // Free the permits by completing the blocked pipe reads.
+    pipe_write
+        .write_all(&vec![0xAB; 64 * (DEPTH as usize + 1)])
+        .expect("pipe write");
+    for h in held {
+        let _ = h.await;
+    }
+
+    // The deferred handle acquires a freed permit on its first poll, submits,
+    // and returns the correct bytes.
+    let got = extra.await.expect("deferred read must complete once a permit frees");
+    assert_eq!(got, content, "deferred read returned wrong bytes");
+    assert_eq!(driver.stats().submitted, u64::from(DEPTH) + 1);
+
+    driver.shutdown();
+    let _ = std::fs::remove_file(path);
 }
 
 /// Drop-without-shutdown path (C17, rustfs/backlog#1066): every other test ends

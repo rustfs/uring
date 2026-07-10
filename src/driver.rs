@@ -19,9 +19,9 @@ use std::io::Write as _;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, TryRecvError};
-use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Context, Poll};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -33,7 +33,7 @@ use io_uring::{IoUring, opcode, types};
 /// cannot interrupt an in-execution regular-file read on a D-state/NFS-hung
 /// disk, so drain-to-zero can be non-terminating; this bounds it.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
-use tokio::sync::oneshot;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError, oneshot};
 
 /// user_data bit marking the CQE of an `AsyncCancel` SQE itself (as opposed
 /// to the CQE of the read op it targets).
@@ -178,65 +178,28 @@ impl ProbeFailure {
     }
 }
 
-/// Submission-side backpressure (C10, rustfs/backlog#1060).
-///
-/// Bounds in-flight ops so the count can never exceed CQ capacity, and — the
-/// load-bearing part — releases a permit at the CQE (pending-table removal),
-/// NOT at future drop. Tying a permit to the future (the natural RAII shape)
-/// would let a quorum dropping many futures return permits while their orphan
-/// buffers still sit in the pending table awaiting slow-disk CQEs, decoupling
-/// the permit count from resident memory and reopening the memory-DoS surface.
-/// P2 uses a tokio `Semaphore` with `acquire_owned`; the RELEASE POINT is what
-/// matters and must stay at the CQE.
-struct Backpressure {
-    state: Mutex<BpState>,
-    cv: Condvar,
-}
+// Submission-side backpressure (C10, rustfs/backlog#1060; async in #1102).
+//
+// A `tokio::sync::Semaphore` with `entries` permits bounds in-flight ops below
+// CQ capacity. The load-bearing rule is the RELEASE POINT: a permit is released
+// at the CQE (when the pending-table entry is removed), NOT at future drop.
+// Tying a permit to the future (the natural RAII shape) would let a quorum
+// dropping many futures return permits while their orphan buffers still sit in
+// the pending table awaiting slow-disk CQEs, decoupling the permit count from
+// resident memory and reopening the memory-DoS surface.
+//
+// That rule is now enforced by the type system rather than by a manual
+// `release()` call: the `OwnedSemaphorePermit` travels with `Msg::Read` into the
+// `Pending` entry and is dropped exactly when the entry is removed at the final
+// CQE. A short-read resubmit keeps the entry — and thus the permit.
+//
+// Acquisition never blocks the caller's thread: `submit` takes the permit with
+// `try_acquire_owned()` on the common unsaturated path (no allocation, no await,
+// submission stays eager), and when saturated it hands the acquire future to the
+// returned `ReadHandle`, which awaits it on its first poll and submits then.
 
-struct BpState {
-    permits: usize,
-    shutdown: bool,
-}
-
-impl Backpressure {
-    fn new(permits: usize) -> Self {
-        Self {
-            state: Mutex::new(BpState {
-                permits,
-                shutdown: false,
-            }),
-            cv: Condvar::new(),
-        }
-    }
-
-    /// Block until a permit is free. Returns false if the driver has shut down
-    /// (so submit stops blocking forever once the driver is gone).
-    fn acquire(&self) -> bool {
-        let mut g = self.state.lock().expect("backpressure mutex poisoned");
-        loop {
-            if g.shutdown {
-                return false;
-            }
-            if g.permits > 0 {
-                g.permits -= 1;
-                return true;
-            }
-            g = self.cv.wait(g).expect("backpressure mutex poisoned");
-        }
-    }
-
-    fn release(&self) {
-        let mut g = self.state.lock().expect("backpressure mutex poisoned");
-        g.permits += 1;
-        self.cv.notify_one();
-    }
-
-    fn shutdown(&self) {
-        let mut g = self.state.lock().expect("backpressure mutex poisoned");
-        g.shutdown = true;
-        self.cv.notify_all();
-    }
-}
+/// Boxed `Semaphore::acquire_owned` future held by a saturated `ReadHandle`.
+type AcquireFut = Pin<Box<dyn Future<Output = Result<OwnedSemaphorePermit, tokio::sync::AcquireError>> + Send>>;
 
 #[derive(Default)]
 struct DriverStats {
@@ -286,6 +249,11 @@ enum Msg {
         offset: u64,
         len: usize,
         done: oneshot::Sender<io::Result<Vec<u8>>>,
+        /// Backpressure permit, acquired before the op reaches the driver and
+        /// released only when the pending entry is dropped at the final CQE
+        /// (rustfs/backlog#1060/#1102). If the driver rejects the op (shutting
+        /// down) the permit is dropped with the message — released immediately.
+        permit: OwnedSemaphorePermit,
     },
     Cancel {
         id: u64,
@@ -311,26 +279,61 @@ enum Msg {
 ///   the driver resubmits the remainder into `buf[nread..]` until the request
 ///   is fully satisfied or a real EOF (res == 0) is seen, so reclamation
 ///   happens only at the FINAL CQE of the logical read.
+/// - `_permit`: the backpressure permit. Holding it here makes the
+///   "release at the CQE, never at future drop" rule (rustfs/backlog#1060) a
+///   property of the type: the permit is dropped exactly when this entry is
+///   removed at the final CQE. A short-read resubmit keeps the entry, and thus
+///   the permit, so in-flight memory stays bounded.
 struct Pending {
     buf: Vec<u8>,
     file: Arc<File>,
     done: Option<oneshot::Sender<io::Result<Vec<u8>>>>,
     offset: u64,
     nread: usize,
+    _permit: OwnedSemaphorePermit,
 }
 
-/// Handle to a submitted read. Await it for the result.
+/// Where a [`ReadHandle`] is in its lifecycle (rustfs/backlog#1102).
+enum HandleState {
+    /// Nothing was ever handed to the driver (a rejected parameter, or the
+    /// driver was already gone). The result is already sitting in `rx`, and
+    /// there is no buffer, permit, or SQE to reclaim.
+    Inert,
+    /// Backpressure was saturated at `submit` time, so the permit — and with it
+    /// the submission — is deferred to the first poll. The caller's thread is
+    /// never blocked. Dropping the handle in this state submitted nothing.
+    WaitingPermit {
+        acquire: AcquireFut,
+        file: Arc<File>,
+        offset: u64,
+        len: usize,
+        done: oneshot::Sender<io::Result<Vec<u8>>>,
+        wake: Arc<EventFd>,
+    },
+    /// The op is with the driver: its buffer lives in the pending table and is
+    /// reclaimed only at the CQE.
+    Submitted,
+}
+
+/// Handle to a read. Await it for the result.
 ///
-/// Dropping it before completion abandons the result only; by default it
-/// also submits `IORING_OP_ASYNC_CANCEL` (best effort) so the CQE — and with
-/// it the buffer reclamation — arrives sooner. `without_cancel_on_drop`
-/// disables that to model the bare "quorum drops the future" case.
+/// Dropping it before completion abandons the result only; if the op was
+/// already submitted it also sends `IORING_OP_ASYNC_CANCEL` (best effort) so the
+/// CQE — and with it the buffer reclamation — arrives sooner.
+/// `without_cancel_on_drop` disables that to model the bare "quorum drops the
+/// future" case.
+///
+/// Submission is eager whenever a backpressure permit is immediately available
+/// (the common case, unchanged from the blocking implementation). Only when the
+/// semaphore is saturated does the handle acquire the permit and submit on its
+/// first poll, so `submit` never blocks a runtime worker.
 pub struct ReadHandle {
     id: u64,
     rx: oneshot::Receiver<io::Result<Vec<u8>>>,
     tx: mpsc::Sender<Msg>,
     finished: bool,
     cancel_on_drop: bool,
+    state: HandleState,
 }
 
 impl ReadHandle {
@@ -344,9 +347,58 @@ impl Future for ReadHandle {
     type Output = io::Result<Vec<u8>>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        match Pin::new(&mut self.rx).poll(cx) {
+        let this = &mut *self;
+
+        // Saturated at submit time: take the permit, then hand the op to the
+        // driver. The permit rides along in the message and is released only
+        // when the pending entry is dropped at the CQE.
+        let acquired = match &mut this.state {
+            HandleState::WaitingPermit { acquire, .. } => match acquire.as_mut().poll(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(res) => Some(res),
+            },
+            _ => None,
+        };
+        if let Some(res) = acquired {
+            let Ok(permit) = res else {
+                // The semaphore was closed: the driver is gone.
+                this.finished = true;
+                return Poll::Ready(Err(io::Error::other("uring driver shut down")));
+            };
+            let HandleState::WaitingPermit {
+                file,
+                offset,
+                len,
+                done,
+                wake,
+                ..
+            } = std::mem::replace(&mut this.state, HandleState::Submitted)
+            else {
+                unreachable!("state was WaitingPermit")
+            };
+            if this
+                .tx
+                .send(Msg::Read {
+                    id: this.id,
+                    file,
+                    offset,
+                    len,
+                    done,
+                    permit,
+                })
+                .is_err()
+            {
+                // Driver gone between the acquire and the send; the message
+                // (with its permit) is dropped, releasing it.
+                this.finished = true;
+                return Poll::Ready(Err(io::Error::other("uring driver shut down")));
+            }
+            wake.signal();
+        }
+
+        match Pin::new(&mut this.rx).poll(cx) {
             Poll::Ready(res) => {
-                self.finished = true;
+                this.finished = true;
                 Poll::Ready(match res {
                     Ok(inner) => inner,
                     Err(_) => Err(io::Error::other("uring driver shut down before completion")),
@@ -360,8 +412,10 @@ impl Future for ReadHandle {
 impl Drop for ReadHandle {
     fn drop(&mut self) {
         // The buffer is deliberately NOT touched here: the driver owns it
-        // until the CQE. All we may do is ask the kernel to hurry up.
-        if !self.finished && self.cancel_on_drop {
+        // until the CQE. All we may do is ask the kernel to hurry up. A handle
+        // dropped before it was submitted (Inert / WaitingPermit) has no buffer,
+        // no permit and no SQE, so there is nothing to cancel.
+        if matches!(self.state, HandleState::Submitted) && !self.finished && self.cancel_on_drop {
             let _ = self.tx.send(Msg::Cancel { id: self.id });
         }
     }
@@ -373,7 +427,10 @@ pub struct UringDriver {
     handle: Option<JoinHandle<()>>,
     stats: Arc<DriverStats>,
     next_id: AtomicU64,
-    bp: Arc<Backpressure>,
+    /// Backpressure permits (one per allowed in-flight op). Closed when the
+    /// driver exits so any waiting `ReadHandle` resolves with a driver-gone
+    /// error instead of hanging (rustfs/backlog#1102).
+    sem: Arc<Semaphore>,
     /// Signaled after every message send so the driver loop wakes immediately
     /// instead of waiting out the heartbeat (backlog#1102).
     wake_efd: Arc<EventFd>,
@@ -412,11 +469,11 @@ impl UringDriver {
         let thread_stats = Arc::clone(&stats);
         // Cap in-flight at the SQ depth (entries), which is < CQ capacity
         // (2*entries), so CQ overflow is structurally unreachable (C5/C10).
-        let bp = Arc::new(Backpressure::new(entries as usize));
-        let thread_bp = Arc::clone(&bp);
+        let sem = Arc::new(Semaphore::new(entries as usize));
+        let thread_sem = Arc::clone(&sem);
         let handle = std::thread::Builder::new()
             .name("uring-spike-driver".into())
-            .spawn(move || drive(ring, rx, thread_stats, thread_bp, cq_efd, thread_wake))
+            .spawn(move || drive(ring, rx, thread_stats, thread_sem, cq_efd, thread_wake))
             .expect("spawn driver thread");
 
         Ok(Self {
@@ -424,7 +481,7 @@ impl UringDriver {
             handle: Some(handle),
             stats,
             next_id: AtomicU64::new(1),
-            bp,
+            sem,
             wake_efd,
         })
     }
@@ -463,6 +520,7 @@ impl UringDriver {
                 tx: self.tx.clone(),
                 finished: false,
                 cancel_on_drop: false,
+                state: HandleState::Inert,
             };
         }
 
@@ -483,55 +541,85 @@ impl UringDriver {
                 tx: self.tx.clone(),
                 finished: false,
                 cancel_on_drop: false,
+                state: HandleState::Inert,
             };
         }
 
-        // Acquire a backpressure permit BEFORE handing the op to the driver;
-        // the driver releases it at the CQE (C10, rustfs/backlog#1060). This
-        // blocks the caller once `entries` ops are in flight, bounding both
-        // in-flight count (< CQ capacity) and resident buffer memory.
-        if !self.bp.acquire() {
-            let _ = done.send(Err(io::Error::other("uring driver shut down")));
-            return ReadHandle {
+        // Take a backpressure permit BEFORE the op reaches the driver; it is
+        // released only when the pending entry is dropped at the CQE (C10,
+        // rustfs/backlog#1060). Acquisition never blocks the caller's thread
+        // (rustfs/backlog#1102).
+        match Arc::clone(&self.sem).try_acquire_owned() {
+            // Fast path: a permit was free, so submit eagerly — no allocation,
+            // no await, and the op is in flight the moment `submit` returns,
+            // exactly as with the previous blocking implementation.
+            Ok(permit) => {
+                if let Err(mpsc::SendError(msg)) = self.tx.send(Msg::Read {
+                    id,
+                    file,
+                    offset,
+                    len,
+                    done,
+                    permit,
+                }) {
+                    // Driver gone: the op never reached it. Surface an explicit
+                    // driver-gone error through `done` instead of letting the
+                    // caller infer one from the dropped oneshot, matching the
+                    // `Closed` arm below. The permit rides back in `msg` and is
+                    // released when it drops here.
+                    if let Msg::Read { done, .. } = msg {
+                        let _ = done.send(Err(io::Error::other("uring driver shut down")));
+                    }
+                    return ReadHandle {
+                        id,
+                        rx,
+                        tx: self.tx.clone(),
+                        finished: false,
+                        cancel_on_drop: false,
+                        state: HandleState::Inert,
+                    };
+                }
+                // Wake the driver loop so the read starts immediately.
+                self.wake_efd.signal();
+                ReadHandle {
+                    id,
+                    rx,
+                    tx: self.tx.clone(),
+                    finished: false,
+                    cancel_on_drop: true,
+                    state: HandleState::Submitted,
+                }
+            }
+            // Saturated: `entries` ops are already in flight. Do NOT block the
+            // calling (runtime worker) thread — hand the acquire future to the
+            // handle, which awaits it on its first poll and submits then.
+            Err(TryAcquireError::NoPermits) => ReadHandle {
                 id,
                 rx,
                 tx: self.tx.clone(),
                 finished: false,
-                cancel_on_drop: false,
-            };
-        }
-
-        // If the driver shut down between acquire and send, give the permit
-        // back — no CQE will ever release it. `done` is dropped with the
-        // returned Msg, which the caller observes as a driver-gone error.
-        if self
-            .tx
-            .send(Msg::Read {
-                id,
-                file,
-                offset,
-                len,
-                done,
-            })
-            .is_err()
-        {
-            self.bp.release();
-            return ReadHandle {
-                id,
-                rx,
-                tx: self.tx.clone(),
-                finished: false,
-                cancel_on_drop: false,
-            };
-        }
-        // Wake the driver loop so the read starts immediately (backlog#1102).
-        self.wake_efd.signal();
-        ReadHandle {
-            id,
-            rx,
-            tx: self.tx.clone(),
-            finished: false,
-            cancel_on_drop: true,
+                cancel_on_drop: true,
+                state: HandleState::WaitingPermit {
+                    acquire: Box::pin(Arc::clone(&self.sem).acquire_owned()),
+                    file,
+                    offset,
+                    len,
+                    done,
+                    wake: Arc::clone(&self.wake_efd),
+                },
+            },
+            // The driver has exited and closed the semaphore.
+            Err(TryAcquireError::Closed) => {
+                let _ = done.send(Err(io::Error::other("uring driver shut down")));
+                ReadHandle {
+                    id,
+                    rx,
+                    tx: self.tx.clone(),
+                    finished: false,
+                    cancel_on_drop: false,
+                    state: HandleState::Inert,
+                }
+            }
         }
     }
 
@@ -756,7 +844,7 @@ fn drive(
     ring: IoUring,
     rx: mpsc::Receiver<Msg>,
     stats: Arc<DriverStats>,
-    bp: Arc<Backpressure>,
+    sem: Arc<Semaphore>,
     cq_efd: EventFd,
     wake_efd: Arc<EventFd>,
 ) {
@@ -797,11 +885,13 @@ fn drive(
                     offset,
                     len,
                     done,
+                    permit,
                 } => {
                     if shutting_down {
                         let _ = done.send(Err(io::Error::other("uring driver shutting down")));
-                        // The op never became in-flight; return its permit.
-                        bp.release();
+                        // The op never became in-flight; dropping `permit` here
+                        // returns it immediately.
+                        drop(permit);
                         continue;
                     }
                     let mut buf = vec![0u8; len];
@@ -821,6 +911,9 @@ fn drive(
                             done: Some(done),
                             offset,
                             nread: 0,
+                            // Released exactly when this entry is removed at the
+                            // final CQE — never at future drop (backlog#1060).
+                            _permit: permit,
                         },
                     );
                     stats.submitted.fetch_add(1, Ordering::SeqCst);
@@ -955,9 +1048,9 @@ fn drive(
                         Err(_) => stats.orphan_reclaimed.fetch_add(1, Ordering::SeqCst),
                     };
                     stats.in_flight.fetch_sub(1, Ordering::SeqCst);
-                    // Release the permit HERE, at the CQE (pending removed),
-                    // not at future drop (C10, rustfs/backlog#1060).
-                    bp.release();
+                    // `p` (and with it `_permit`) is dropped here, at the CQE
+                    // and pending-table removal — never at future drop (C10,
+                    // rustfs/backlog#1060). No manual release to forget.
                 }
                 ReapStep::Resubmit(sqe) => state.backlog.push_back(sqe),
             }
@@ -980,7 +1073,9 @@ fn drive(
         //    blocking forever (C4, rustfs/backlog#1055).
         if shutting_down {
             if state.pending.is_empty() && state.backlog.is_empty() {
-                bp.shutdown(); // unblock any submit() waiter before we exit
+                // Close the semaphore so any handle still awaiting a permit
+                // resolves with a driver-gone error instead of hanging.
+                sem.close();
                 return; // clean drain: DriverState drops normally, ring unmaps.
             }
             let deadline = *drain_deadline.get_or_insert_with(|| Instant::now() + DRAIN_TIMEOUT);
@@ -994,7 +1089,10 @@ fn drive(
                      leaking ring + buffers to stay memory-safe",
                     state.pending.len()
                 );
-                bp.shutdown(); // unblock any submit() waiter
+                // Close the semaphore so any handle awaiting a permit resolves
+                // with a driver-gone error. The leaked pending entries keep
+                // their permits, which is fine: nothing will wait on them.
+                sem.close();
                 std::mem::forget(state);
                 return;
             }
