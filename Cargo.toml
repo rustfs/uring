@@ -25,8 +25,10 @@ readme = "README.md"
 homepage = "https://rustfs.com"
 keywords = ["io_uring", "async", "storage", "rustfs", "linux"]
 categories = ["asynchronous", "filesystem"]
-# Not published to crates.io yet: git dependency only until the P2 work
-# (write path, eventfd/AsyncFd reaping, O_DIRECT) lands. See docs/DESIGN.md.
+# Publish-ready for 0.1.0: metadata is complete and every dependency is on
+# crates.io. Kept `publish = false` until a maintainer cuts the crates.io
+# release; flip this (and drop the `until published` note in rustfs/rustfs's
+# ecstore dependency) to publish. See docs/DESIGN.md / CHANGELOG.md.
 publish = false
 
 [dependencies]

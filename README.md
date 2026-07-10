@@ -13,10 +13,11 @@ the [#1048/#1051 audit](https://github.com/rustfs/backlog/issues/1051). It lives
 verified in isolation — with a real io_uring CI leg that the main `rustfs/rustfs` workspace cannot run — before being
 wired into the storage layer.
 
-> **Status:** read path only, Linux only. **Not published to crates.io** (`publish = false`) — depend on it by pinning a
-> git revision. The read path is wired into `rustfs/rustfs` behind a runtime probe and is **off by default**
-> (`RUSTFS_IO_URING_READ_ENABLE`). See [`CHANGELOG.md`](CHANGELOG.md) for what has landed and
-> [`docs/DESIGN.md`](docs/DESIGN.md) for the invariants.
+> **Status:** read path only, Linux only. **0.1.0 is publish-ready** — the metadata is complete and every dependency is
+> on crates.io — but `publish = false` is kept until a maintainer cuts the crates.io release; the badges above go live
+> then. Until then, depend on it by pinning a git revision (below). The read path is wired into `rustfs/rustfs` behind a
+> runtime probe and is **off by default** (`RUSTFS_IO_URING_READ_ENABLE`). See [`CHANGELOG.md`](CHANGELOG.md) for what
+> has landed and [`docs/DESIGN.md`](docs/DESIGN.md) for the invariants.
 
 ```toml
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -98,11 +99,11 @@ the range you asked for. Padding, the bytes before the range, and the block-alig
 # use rustfs_uring::UringDriver;
 # use std::{fs::File, sync::Arc};
 # async fn demo(driver: &UringDriver, file: Arc<File>) -> std::io::Result<()> {
-    // `file` was opened with O_DIRECT; 4096 is the probed logical block size.
-    let bytes = driver.read_at_direct(file, 8_191, 100, 4096).await?;
-    assert_eq!(bytes.len(), 100);
-    # Ok(())
-    # }
+// `file` was opened with O_DIRECT; 4096 is the probed logical block size.
+let bytes = driver.read_at_direct(file, 8_191, 100, 4096).await?;
+assert_eq!(bytes.len(), 100);
+# Ok(())
+# }
 ```
 
 ## When this crate helps — and when it does not
@@ -111,12 +112,12 @@ These numbers come from the harnesses in this repository and from end-to-end pro
 ([rustfs/backlog#1159](https://github.com/rustfs/backlog/issues/1159)). They are reported as measured, including the
 cases where io_uring loses.
 
-| workload                                                                     | result                                                                                                                                                                                                                                             |
-|------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| **Many concurrent positioned reads on one disk** (erasure-coded shard reads) | **Where it wins.** With sharded rings and a cached fd: 64 KiB at concurrency 128 → 361k IOPS vs 125k for a blocking-pool baseline, and p999 3.0 ms vs 13.5 ms.                                                                                     |
-| **A single sequential stream**                                               | **It loses.** Kernel readahead already does what pipelining would buy. Cold reads are device-bound; on a warm page cache io_uring reaches only 11–41% of a buffered read. Streaming reads should stay on the std backend.                          |
-| **One read at a time (low concurrency)**                                     | **It loses.** Per-op submission overhead exceeds a page-cache `memcpy`.                                                                                                                                                                            |
-| **End-to-end S3 GET**                                                        | **Roughly neutral today (−7% … +4%).** The disk read is not the bottleneck: a cached 1 MiB GET spends ~25% of CPU in `memcpy` and ~10% in `memset`, and 0% on device reads. Optimising the read path further only pays once those copies are gone. |
+| workload | result |
+| --- | --- |
+| **Many concurrent positioned reads on one disk** (erasure-coded shard reads) | **Where it wins.** With sharded rings and a cached fd: 64 KiB at concurrency 128 → 361k IOPS vs 125k for a blocking-pool baseline, and p999 3.0 ms vs 13.5 ms. |
+| **A single sequential stream** | **It loses.** Kernel readahead already does what pipelining would buy. Cold reads are device-bound; on a warm page cache io_uring reaches only 11–41% of a buffered read. Streaming reads should stay on the std backend. |
+| **One read at a time (low concurrency)** | **It loses.** Per-op submission overhead exceeds a page-cache `memcpy`. |
+| **End-to-end S3 GET** | **Roughly neutral today (−7% … +4%).** The disk read is not the bottleneck: a cached 1 MiB GET spends ~25% of CPU in `memcpy` and ~10% in `memset`, and 0% on device reads. Optimising the read path further only pays once those copies are gone. |
 
 Two traps this crate's own benchmarking fell into, documented so others do not repeat them:
 
