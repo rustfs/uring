@@ -13,15 +13,13 @@ the [#1048/#1051 audit](https://github.com/rustfs/backlog/issues/1051). It lives
 verified in isolation — with a real io_uring CI leg that the main `rustfs/rustfs` workspace cannot run — before being
 wired into the storage layer.
 
-> **Status:** read path only, Linux only. **0.1.0 is publish-ready** — the metadata is complete and every dependency is
-> on crates.io — but `publish = false` is kept until a maintainer cuts the crates.io release; the badges above go live
-> then. Until then, depend on it by pinning a git revision (below). The read path is wired into `rustfs/rustfs` behind a
-> runtime probe and is **off by default** (`RUSTFS_IO_URING_READ_ENABLE`). See [`CHANGELOG.md`](CHANGELOG.md) for what
-> has landed and [`docs/DESIGN.md`](docs/DESIGN.md) for the invariants.
+> **Status:** read path only, Linux only. The read path is wired into `rustfs/rustfs` behind a runtime probe and is
+> **off by default** (`RUSTFS_IO_URING_READ_ENABLE`). See [`CHANGELOG.md`](CHANGELOG.md) for what has landed and the
+> [design notes](https://github.com/rustfs/uring/blob/v0.1.0/docs/DESIGN.md) for the invariants.
 
 ```toml
 [target.'cfg(target_os = "linux")'.dependencies]
-rustfs-uring = { git = "https://github.com/rustfs/uring", rev = "<pin a commit>" }
+rustfs-uring = "0.1.0"
 ```
 
 ## The ownership model it enforces
@@ -42,7 +40,7 @@ proves and enforces the invariants any production io_uring integration must foll
 Each invariant holds **per shard** (see below), because a shard is an independent instance of the same driver.
 
 The full invariant list, the corrected fd-reuse mechanism, and the design constraints are in
-[`docs/DESIGN.md`](docs/DESIGN.md).
+the [design notes](https://github.com/rustfs/uring/blob/v0.1.0/docs/DESIGN.md).
 
 ## Usage
 

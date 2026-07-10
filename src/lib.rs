@@ -29,9 +29,13 @@
 //!   `in_flight == 0` (with a bounded escape hatch) before the ring is
 //!   unmapped.
 //!
-//! Status: read path only. Still to come for full production use — eventfd +
-//! `AsyncFd` reaping (replacing the poll loop), O_DIRECT alignment,
-//! `LocalIoBackend` integration, and the write path. See `docs/DESIGN.md`.
+//! Status: read path only, Linux only. The driver supports positioned buffered
+//! reads, `O_DIRECT` reads with internal alignment, sharded rings, async
+//! backpressure, eventfd-driven reaping, graceful restricted-environment
+//! detection, and bounded shutdown drain. The write path is intentionally out
+//! of scope for `0.1.0`; see the
+//! [design notes](https://github.com/rustfs/uring/blob/v0.1.0/docs/DESIGN.md)
+//! for the invariant details.
 
 #[cfg(target_os = "linux")]
 mod driver;

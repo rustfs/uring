@@ -21,14 +21,11 @@ All notable changes to `rustfs-uring` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-**0.1.0 is publish-ready** — the metadata is complete and every dependency is on crates.io — but
-`publish = false` is kept until a maintainer cuts the crates.io release. Until then, consumers pin a
-git revision, so entries stay under `[Unreleased]` and each one names the commit that landed it. When
-0.1.0 is released, this whole section moves under a `## [0.1.0] - <date>` heading unchanged.
-
 ## [Unreleased]
 
-Everything below is in `main`, will make up 0.1.0, and is reachable now by pinning the listed revision.
+No unreleased changes.
+
+## [0.1.0] - 2026-07-11
 
 ### Added
 
@@ -119,7 +116,7 @@ polished (`39018c0`).
 The cancel-safety invariants that survived that audit — the driver's pending table owning the
 buffer and fd from SQE submission until the CQE, drop-abandons-result-only, bounded shutdown
 drain, abort-before-free on a driver panic — are the ones every change above is measured
-against. See [`docs/DESIGN.md`](docs/DESIGN.md).
+against. See the [design notes](https://github.com/rustfs/uring/blob/v0.1.0/docs/DESIGN.md).
 
 ## Decisions recorded, not implemented
 
@@ -151,4 +148,5 @@ built. They are listed so nobody re-opens them without new evidence.
 [rustfs/backlog#1051]: https://github.com/rustfs/backlog/issues/1051
 [rustfs/backlog#1144]: https://github.com/rustfs/backlog/issues/1144
 [rustfs/backlog#1159]: https://github.com/rustfs/backlog/issues/1159
-[Unreleased]: https://github.com/rustfs/uring/commits/main
+[Unreleased]: https://github.com/rustfs/uring/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/rustfs/uring/releases/tag/v0.1.0

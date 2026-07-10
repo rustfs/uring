@@ -25,11 +25,7 @@ readme = "README.md"
 homepage = "https://rustfs.com"
 keywords = ["io_uring", "async", "storage", "rustfs", "linux"]
 categories = ["asynchronous", "filesystem"]
-# Publish-ready for 0.1.0: metadata is complete and every dependency is on
-# crates.io. Kept `publish = false` until a maintainer cuts the crates.io
-# release; flip this (and drop the `until published` note in rustfs/rustfs's
-# ecstore dependency) to publish. See docs/DESIGN.md / CHANGELOG.md.
-publish = false
+exclude = ["docs/**"]
 
 [dependencies]
 tokio = { version = "1.52.3", default-features = false, features = ["sync"] }
