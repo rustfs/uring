@@ -2,6 +2,8 @@
 
 [![CI](https://github.com/rustfs/uring/actions/workflows/ci.yml/badge.svg)](https://github.com/rustfs/uring/actions/workflows/ci.yml)
 [![license](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://github.com/rustfs/uring/blob/main/LICENSE)
+[![crates](https://img.shields.io/crates/v/rustfs-uring.svg)](https://crates.io/crates/rustfs-uring)
+[![docs.rs](https://docs.rs/rustfs-uring/badge.svg)](https://docs.rs/rustfs-uring/)
 
 Cancel-safe async `io_uring` read backend for [RustFS](https://github.com/rustfs/rustfs) storage.
 
@@ -96,11 +98,11 @@ the range you asked for. Padding, the bytes before the range, and the block-alig
 # use rustfs_uring::UringDriver;
 # use std::{fs::File, sync::Arc};
 # async fn demo(driver: &UringDriver, file: Arc<File>) -> std::io::Result<()> {
-// `file` was opened with O_DIRECT; 4096 is the probed logical block size.
-let bytes = driver.read_at_direct(file, 8_191, 100, 4096).await?;
-assert_eq!(bytes.len(), 100);
-# Ok(())
-# }
+    // `file` was opened with O_DIRECT; 4096 is the probed logical block size.
+    let bytes = driver.read_at_direct(file, 8_191, 100, 4096).await?;
+    assert_eq!(bytes.len(), 100);
+    # Ok(())
+    # }
 ```
 
 ## When this crate helps — and when it does not
@@ -109,12 +111,12 @@ These numbers come from the harnesses in this repository and from end-to-end pro
 ([rustfs/backlog#1159](https://github.com/rustfs/backlog/issues/1159)). They are reported as measured, including the
 cases where io_uring loses.
 
-| workload | result |
-| --- | --- |
-| **Many concurrent positioned reads on one disk** (erasure-coded shard reads) | **Where it wins.** With sharded rings and a cached fd: 64 KiB at concurrency 128 → 361k IOPS vs 125k for a blocking-pool baseline, and p999 3.0 ms vs 13.5 ms. |
-| **A single sequential stream** | **It loses.** Kernel readahead already does what pipelining would buy. Cold reads are device-bound; on a warm page cache io_uring reaches only 11–41% of a buffered read. Streaming reads should stay on the std backend. |
-| **One read at a time (low concurrency)** | **It loses.** Per-op submission overhead exceeds a page-cache `memcpy`. |
-| **End-to-end S3 GET** | **Roughly neutral today (−7% … +4%).** The disk read is not the bottleneck: a cached 1 MiB GET spends ~25% of CPU in `memcpy` and ~10% in `memset`, and 0% on device reads. Optimising the read path further only pays once those copies are gone. |
+| workload                                                                     | result                                                                                                                                                                                                                                             |
+|------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **Many concurrent positioned reads on one disk** (erasure-coded shard reads) | **Where it wins.** With sharded rings and a cached fd: 64 KiB at concurrency 128 → 361k IOPS vs 125k for a blocking-pool baseline, and p999 3.0 ms vs 13.5 ms.                                                                                     |
+| **A single sequential stream**                                               | **It loses.** Kernel readahead already does what pipelining would buy. Cold reads are device-bound; on a warm page cache io_uring reaches only 11–41% of a buffered read. Streaming reads should stay on the std backend.                          |
+| **One read at a time (low concurrency)**                                     | **It loses.** Per-op submission overhead exceeds a page-cache `memcpy`.                                                                                                                                                                            |
+| **End-to-end S3 GET**                                                        | **Roughly neutral today (−7% … +4%).** The disk read is not the bottleneck: a cached 1 MiB GET spends ~25% of CPU in `memcpy` and ~10% in `memset`, and 0% on device reads. Optimising the read path further only pays once those copies are gone. |
 
 Two traps this crate's own benchmarking fell into, documented so others do not repeat them:
 
