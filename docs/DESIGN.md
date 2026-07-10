@@ -4,13 +4,17 @@
 
 ## 这是什么
 
-rustfs/backlog#897 路线图中 P2(io_uring 读后端)被 P1.5 基准判 NO-GO 而 defer。本 spike 是 #894 明确要求先行的**取消安全原型**——P2 中风险最高、最容易随时间流失的知识,按"只实现原型、不进主干、不启用"的方案 B 存档。重启条件满足前,P2 主体不动工。
+rustfs/backlog#897 路线图中 P2(io_uring 读后端)被 P1.5 基准判 NO-GO 而 defer。本 spike 是 #894 明确要求先行的**取消安全原型**——P2 中风险最高、最容易随时间流失的知识,按"只实现原型、不进主干、不启用"的方案 B 存档。
+
+> **现状更新(2026-07):** P2 主体已在此库实现并接入 `rustfs/rustfs`,但**默认灰度关**(`RUSTFS_IO_URING_READ_ENABLE`)。端到端 A/B(rustfs/backlog#1159)显示 io_uring 对 S3 GET 大致中性(−7%~+4%),瓶颈在用户态拷贝而非磁盘读,因此 #1048 转为 **[Watch] 看护 issue**——真实直连 NVMe 证据满足前不默认启用。下方"对 P2 主体实现的遗留项"一节记录了每项的落地/决策现状。本文其余部分(所有权模型、不变量、测试矩阵)是这些实现共同遵守的契约,持续有效。
 
 **本 crate 是独立 workspace**(Cargo.toml 内含空 `[workspace]` 表),io-uring 依赖不进入 rustfs 主 Cargo.lock、不参与主工程构建与 CI。这与守卫脚本 `scripts/check_no_tokio_io_uring.sh` 的约束一致:禁的是 tokio 的 io-uring runtime feature,应用层显式 io-uring 集成必须走运行时探测的独立后端(即本原型验证的模型)。
 
 ## 要证明的问题
 
-EC quorum 达成 / 断连 / 超时会 drop 在途的 `BitrotReaderTask` future(main 上位于 `crates/ecstore/src/set_disk/core/io_primitives.rs:1455` 的 `FuturesUnordered`)。若该 future 已向内核提交了 read SQE,内核在 CQE 之前始终可能向目标 buffer 写入。**future 的 drop 不能回收 buffer,否则是 use-after-free。**
+EC 读会 drop 在途的分片读 future;若该 future 已向内核提交了 read SQE,内核在 CQE 之前始终可能向目标 buffer 写入。**future 的 drop 不能回收 buffer,否则是 use-after-free。**
+
+> **该场景在生产 GET 上被真实行使(2026-07 核对 main):** 主触发点是**读者建立阶段**——`crates/ecstore/src/set_disk/core/io_primitives.rs` 的 `create_bitrot_readers_until_quorum_all_shards`(`FuturesUnordered` 于 :1362 建立、setup quorum break 于 :1403、多余任务于 :1428 `drop(reader_tasks)`)。数据分片在此阶段经 `read_file_mmap_copy → UringBackend::pread_bytes → driver.read_at(...).await` **急切**读入,因此一个仍停在该 `.await` 的任务被 drop 时,其 `ReadHandle` 在 `Submitted` 态被 drop、触发 `ASYNC_CANCEL`(`ReadHandle::drop`,`src/driver.rs`)。这在**每个响应盘多于 setup quorum 的 GET(常态)**都发生,与后续是否重建无关。decode 阶段(`ParallelReader`,`crates/ecstore/src/erasure/coding/decode.rs`)的 `FuturesUnordered` 也在 quorum 处 drop 落败者,但对 io_uring 只在**非 lockstep 路径的延迟 parity reader 边打开边被 drop**时命中(数据分片此时已是内存 `Bytes`,lockstep 路径则全量 drain、从不中途 drop)。
 
 ## 验证的所有权模型
 
@@ -63,7 +67,7 @@ future drop(任意时刻)                                        │
 | `cancel_stress_accounts_for_every_buffer` | 压力:256 并发读、一半立即 drop;`delivered + orphan_reclaimed == submitted`,幸存读逐字节正确 |
 | `shutdown_drains_in_flight_ops` | 关停:两个阻塞在途 op 被 cancel + drain 到 0 后线程才退出,持有的 future 解析为 ECANCELED |
 
-## 如何运行
+> 上表是 spike 原始 5 项核心断言。接入期实现随之新增覆盖,`tests/cancel.rs` 现共 **15 项**,补充:`saturated_submit_defers_instead_of_blocking`(异步背压不阻塞 runtime worker)、`direct_read_returns_exact_unaligned_ranges`(O_DIRECT 非对齐区间精确交付、填充不外泄)、`sharded_driver_conserves_buffers_across_shards` 与 `sharded_driver_with_one_shard_matches_single_ring`(分片下守恒 + 单片等价)、以及 boundary/pipe/EOF 等边界。所有项在 `run-docker.sh` 两腿下运行(leg 1 全优雅降级、leg 2 真实 io_uring)。
 
 需要 Docker(Linux 内核)。macOS 宿主上 `cargo check` 只验证非 Linux 桩编译。
 
@@ -78,16 +82,22 @@ future drop(任意时刻)                                        │
 
 两腿一次通过,详见"实测记录"。
 
-## 对 P2 主体实现的遗留项(本 spike 不覆盖)
+## 对 P2 主体实现的遗留项 — 落地/决策现状
 
-- **[已部分整改 rustfs/backlog#1102]** 200µs 忙轮询已由 eventfd 唤醒替换:一个 eventfd 注册到 ring(内核每 CQE 信号)、一个由 `submit`/shutdown 信号,驱动线程 `poll` 两者阻塞等待,`submit()` 每轮仍冲刷 NODROP overflow list。**剩余**:tokio `AsyncFd` 收割(去掉专用驱动线程、把收割并入 tokio reactor)——需下放提交侧,是更大的重构。
-- 进程级单例 ring 的生命周期管理(本 spike 每测试一个 ring);Drop 路径不得无界阻塞 tokio worker。
-- **[已整改 rustfs/backlog#1102]** O_DIRECT 对齐读:`read_at_direct(file, offset, len, align)`。驱动读**块对齐超范围**到**块对齐 buffer**(超额分配 `align-1` 字节,在分配内部取第一个对齐字节作为读区起点),完成后只把逻辑区间 `[offset, offset+len)` 切出交给调用方——**对齐填充、区间前缀、块对齐尾部一律不外泄**(否则 `BitrotReader` 会把补齐字节当损坏)。短读 resubmit 保持块对齐;内核返回非块倍数即文件尾,停止并交付。缓冲读是 `align == 1` 的退化情形,几何完全一致。**剩余**:调用方(ecstore)以 O_DIRECT 打开 fd 并接线(见 rustfs/rustfs#4645 的临时分流)。
-- 三条读形态接入 `LocalIoBackend`。
-- per-disk 探测缓存与运行期 errno 降级闩锁(参照 main 上 `DirectIoReadState`,`crates/ecstore/src/disk/local.rs`;运行期 errno 分类须按不变量补充里的三分类,勿复用 probe 期分类)。
-- registered buffers(P3,内容卫生见不变量 8 / rustfs/backlog#1062)/写路径(P4)完全不涉及。
+> 本节原为"本 spike 不覆盖"的清单;下列各项经 rustfs/backlog#1102/#1144/#1145/#1159 处理后现状如下。三种收尾:**✅ 已实现**、**⛔ 经度量/设计决策关闭(不做)**、**⬜ 仍未做(正确 defer)**。
+
+- **✅ eventfd 唤醒收割(rustfs/backlog#1102)。** 200µs 忙轮询已由 eventfd 替换:一个 eventfd 注册到 ring(内核每 CQE 信号)、一个由 `submit`/shutdown 信号,驱动线程 `poll` 两者阻塞等待,`submit()` 每轮仍冲刷 NODROP overflow list。
+  - **⛔ tokio `AsyncFd` 去驱动线程 — 不做。** `Drop` 不能 `await`,shutdown 的有界 drain 排空会被逼成公开 API 破坏。现"专用驱动线程 + eventfd 阻塞收割"已消除忙轮询,是无破坏的等价收益。
+- **✅→⛔ ring 生命周期 → 改为 per-disk 分片。** "进程级单例 ring"与坏盘隔离诉求(一块坏盘不得拖垮其它盘)相冲,已**重定义**为 per-disk ring 集,并用 `probe_and_start_sharded(entries, shards)` 在盘内横向扩展(每分片独立线程/pending 表/背压/eventfd)。Drop/shutdown 先让所有分片停再逐片 join,`DRAIN_TIMEOUT` 上界防坏盘无界阻塞。
+- **✅ O_DIRECT 对齐读:`read_at_direct(file, offset, len, align)`(rustfs/backlog#1102)。** 驱动读**块对齐超范围**到**块对齐 buffer**(超额分配 `align-1` 字节,在分配内部取第一个对齐字节作为读区起点),完成后只把逻辑区间 `[offset, offset+len)` 切出——**对齐填充、区间前缀、块对齐尾部一律不外泄**(否则 `BitrotReader` 会把补齐字节当损坏)。短读 resubmit 保持块对齐;内核返回非块倍数即文件尾。缓冲读是 `align == 1` 的退化情形。
+  - **✅ ecstore 已原生接线**(rustfs/rustfs#4649):`pread_uring_direct` 以 O_DIRECT 打开 fd 并调 `read_at_direct`,分层兜底 + per-disk 闩锁。**已取代 #4645 的临时分流**(那版把 O_DIRECT 合格读交回 StdBackend)。
+- **✅→⛔ 三读形态接入 `LocalIoBackend` — 部分做、部分不做。** **定位读 `pread_bytes` 已接** io_uring(缓冲 + 原生 O_DIRECT)。**流式读 `open_read_stream`/`open_full_read` 判 NO-GO**(rustfs/backlog#1144):io_uring 对单条顺序流无杠杆(内核 readahead 已胜),冷读设备瓶颈、暖读仅 11–41% 于 buffered——保持委托 StdBackend。
+- **✅ per-disk 探测缓存 + 运行期 errno 降级闩锁(rustfs/backlog#1101)。** `URING_UNSUPPORTED_DISKS` 负探测缓存 + `is_io_uring_unsupported` 运行期 errno 三分类(仅限制类 `EPERM/EACCES/ENOSYS/EOPNOTSUPP` 触发整盘闩死,数据/参数错误不闩),与 probe 期分类分离。
+- **⬜ registered buffers(P3)/ 写路径(P4)— 仍未做(正确 defer)。** `register_buffers` 与本文档"buffer 归 pending 表、`Vec<u8>` 所有权"的取消安全模型冲突,需重设计;且 #1159 端到端 profiling 显示读路径已非瓶颈,优先级低。写路径(PUT)完全未涉及,profiling 提示其收益可能大于读路径。
 
 **已在本 spike 内整改**(rustfs/backlog#1051):SQ 深度背压(不变量 7)、驱动线程 unwind 安全(不变量 6)、shutdown 有界 drain、CQ overflow/NODROP/EBUSY 处理、probe UAF、probe 文件安全创建、errno 三分类、len/offset 校验、短读 resubmit。
+
+**接入后新增的行为契约**(实现期发现,非 spike 原文):`UringBackend` 读完须遵守 StdBackend 的页缓存回收策略(≥4 MiB 读后 `fadvise(DONTNEED)`),否则开启 io_uring 即静默污染页缓存(rustfs/rustfs#4662 修复的回归)。
 
 ## 实测记录
 
@@ -101,4 +111,4 @@ future drop(任意时刻)                                        │
   - `cancel_stress_accounts_for_every_buffer` ok — 256 op、128 drop,`delivered(128) + orphan_reclaimed(128) == submitted(256)`;
   - `shutdown_drains_in_flight_ops` ok — drain 到 0 后退出,持有 future 解析为 ECANCELED。
 
-**结论:GO(模型可行)。** buffer/fd 归驱动 pending 表、CQE 唯一回收点、ASYNC_CANCEL 加速、shutdown drain 的组合在真实内核上成立,且降级契约在受限环境下按设计生效。P2 主体重启时可直接沿用此所有权模型。
+**结论:GO(模型可行)。** buffer/fd 归驱动 pending 表、CQE 唯一回收点、ASYNC_CANCEL 加速、shutdown drain 的组合在真实内核上成立,且降级契约在受限环境下按设计生效。**P2 主体已据此模型实现**(见上"落地/决策现状"),接入 `rustfs/rustfs` 后默认灰度关,15 项取消安全验收测试是这些实现共同遵守的回归门禁。
