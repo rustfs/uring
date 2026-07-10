@@ -59,7 +59,11 @@ const MAX_READ_LEN: usize = 0x7fff_f000;
 ///
 /// `None` when `align` is not a power of two or the aligned range would overflow.
 fn aligned_geometry(offset: u64, len: usize, align: usize) -> Option<(u64, usize, usize)> {
-    if align == 0 || !align.is_power_of_two() {
+    // A real device block is tiny (512..=4096). Capping alignment at the read
+    // cap keeps `align_offset(align)` always satisfiable (so it never returns
+    // `usize::MAX`, which would make the driver's later `ptr::add(pad)` UB) and
+    // keeps the `region_len + align - 1` allocation from overflowing `usize`.
+    if align == 0 || !align.is_power_of_two() || align > MAX_READ_LEN {
         return None;
     }
     if align == 1 {
@@ -933,7 +937,12 @@ impl Drop for DriverState {
 fn deliver(p: &mut Pending) -> Vec<u8> {
     let avail = p.nread.saturating_sub(p.head).min(p.want);
     let start = p.pad + p.head;
-    p.buf.copy_within(start..start + avail, 0);
+    // The buffered path (`align == 1`) has `pad == 0` and `head == 0`, so the
+    // logical range already starts at byte 0 — skip the full-buffer memmove and
+    // just truncate. Only the O_DIRECT path (nonzero start) needs the shift.
+    if start != 0 && avail != 0 {
+        p.buf.copy_within(start..start + avail, 0);
+    }
     p.buf.truncate(avail);
     std::mem::take(&mut p.buf)
 }
@@ -1008,9 +1017,28 @@ fn drive(
                     // buffer, so over-allocate by `align - 1` and start the read
                     // region at the first aligned byte inside the allocation.
                     // For a buffered read this degenerates to `vec![0u8; len]`.
-                    let mut buf = vec![0u8; region_len + align - 1];
+                    // `submit` already capped `align <= MAX_READ_LEN` and
+                    // `region_len <= MAX_READ_LEN`, so this add cannot overflow;
+                    // the checked form keeps the invariant explicit rather than
+                    // relying on it silently.
+                    let cap = match region_len.checked_add(align - 1) {
+                        Some(cap) => cap,
+                        None => {
+                            let _ = done.send(Err(io::Error::other("aligned O_DIRECT allocation size overflow")));
+                            drop(permit);
+                            continue;
+                        }
+                    };
+                    let mut buf = vec![0u8; cap];
                     let pad = buf.as_ptr().align_offset(align);
-                    debug_assert!(pad + region_len <= buf.len(), "aligned region must fit the allocation");
+                    // Runtime guard (not a debug-only assert): if the allocator
+                    // ever returned a block `align_offset` cannot satisfy, refuse
+                    // the read instead of doing UB pointer arithmetic below.
+                    if pad == usize::MAX || pad.checked_add(region_len).is_none_or(|end| end > buf.len()) {
+                        let _ = done.send(Err(io::Error::other("could not align O_DIRECT read buffer")));
+                        drop(permit);
+                        continue;
+                    }
 
                     // The raw pointer is captured before `buf` moves into the
                     // table; moving the Vec never relocates its heap block, and

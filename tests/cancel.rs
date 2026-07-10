@@ -452,17 +452,27 @@ async fn pipe_half_close_reads_eof() {
     driver.shutdown();
 }
 
-/// Open `path` read-only with `O_DIRECT`. `None` when the filesystem refuses it
-/// (tmpfs, some overlay/network mounts), which is a legitimate configuration.
+/// Open `path` read-only with `O_DIRECT`. `None` ONLY when the filesystem
+/// genuinely refuses O_DIRECT (tmpfs, some overlay/network mounts return EINVAL
+/// or EOPNOTSUPP), which is a legitimate configuration to skip on. Any other
+/// error (ENOENT, EMFILE, EACCES, …) is a real test bug and panics loudly so it
+/// can't masquerade as a skipped assertion; EINTR is retried.
 fn open_direct(path: &std::path::Path) -> Option<Arc<File>> {
     use std::os::unix::ffi::OsStrExt;
-    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
-    // SAFETY: `c_path` is a valid NUL-terminated path; on success we own the fd.
-    let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_DIRECT | libc::O_CLOEXEC) };
-    if fd < 0 {
-        return None;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("temp path has no NUL");
+    loop {
+        // SAFETY: `c_path` is a valid NUL-terminated path; on success we own the fd.
+        let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_DIRECT | libc::O_CLOEXEC) };
+        if fd >= 0 {
+            return Some(Arc::new(unsafe { File::from_raw_fd(fd) }));
+        }
+        let err = std::io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::EINTR) => continue,
+            Some(libc::EINVAL) | Some(libc::EOPNOTSUPP) => return None,
+            _ => panic!("open({}, O_DIRECT) failed unexpectedly: {err}", path.display()),
+        }
     }
-    Some(Arc::new(unsafe { File::from_raw_fd(fd) }))
 }
 
 /// O_DIRECT positioned read (rustfs/backlog#1102): the driver reads the
