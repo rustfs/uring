@@ -45,6 +45,21 @@ fn driver_or_skip(name: &str) -> Option<UringDriver> {
     }
 }
 
+/// Like `driver_or_skip` but with `shards` independent rings (backlog#1145).
+fn sharded_driver_or_skip(name: &str, shards: usize) -> Option<UringDriver> {
+    match UringDriver::probe_and_start_sharded(64, shards) {
+        Ok(d) => Some(d),
+        Err(e) => {
+            assert!(
+                e.is_expected_restriction(),
+                "probe failed OUTSIDE the expected restriction errno class: {e:?}"
+            );
+            eprintln!("SKIP {name}: restricted environment, graceful degradation path taken ({e:?})");
+            None
+        }
+    }
+}
+
 /// Deterministic pseudo-random content so reads are verifiable.
 fn make_content(len: usize) -> Vec<u8> {
     let mut state: u64 = 0x2545F4914F6CDD1D;
@@ -626,4 +641,74 @@ async fn drop_without_shutdown_drains_and_cancels() {
         assert_eq!(err.raw_os_error(), Some(libc::ECANCELED), "unexpected error: {err:?}");
     }
     drop(pipe_write);
+}
+
+/// Sharding the driver's rings (backlog#1145) must not weaken the cancel-safety
+/// model: every op the driver accepted is still delivered to a live caller or
+/// orphan-reclaimed at its CQE, and the aggregate counters conserve. Ops are
+/// round-robined across shards, so a cancel routed to the wrong ring — or a
+/// pending table that lost an entry across the split — shows up here as a
+/// conservation violation or a content mismatch.
+///
+/// Deliberately mixes dropped and kept handles, exactly as `cancel_stress` does,
+/// but across 4 rings so the drop lands on a shard other than the one the next
+/// submit picks.
+#[tokio::test(flavor = "multi_thread")]
+async fn sharded_driver_conserves_buffers_across_shards() {
+    const SHARDS: usize = 4;
+    let Some(driver) = sharded_driver_or_skip("sharded_driver_conserves_buffers_across_shards", SHARDS) else {
+        return;
+    };
+    const LEN: usize = 8 << 20;
+    const OPS: usize = 256;
+    const READ_LEN: usize = 64 << 10;
+    let content = make_content(LEN);
+    let (path, file) = temp_file_with(&content, "sharded-stress");
+
+    let mut kept = Vec::new();
+    for i in 0..OPS {
+        let offset = (i * 97_611) % (LEN - READ_LEN);
+        let handle = driver.read_at(Arc::clone(&file), offset as u64, READ_LEN);
+        if i % 2 == 0 {
+            drop(handle);
+        } else {
+            kept.push((offset, handle));
+        }
+    }
+
+    // Correctness across shards: a kept read must return its own bytes, not a
+    // neighbouring shard's.
+    for (offset, handle) in kept {
+        let got = handle.await.expect("kept read failed");
+        assert_eq!(got, &content[offset..offset + READ_LEN], "mismatch at offset {offset}");
+    }
+
+    let snap = driver.shutdown();
+    assert!(snap.submitted <= OPS as u64, "more ops submitted than requested: {snap:?}");
+    assert!(snap.delivered >= (OPS / 2) as u64, "kept half not all delivered: {snap:?}");
+    assert_eq!(
+        snap.delivered + snap.orphan_reclaimed,
+        snap.submitted,
+        "some buffers are unaccounted for across shards: {snap:?}"
+    );
+    assert_eq!(snap.in_flight, 0, "shutdown left ops in flight: {snap:?}");
+    assert_eq!(snap.cq_overflow, 0, "per-shard in-flight cap must keep CQ overflow unreachable: {snap:?}");
+    let _ = std::fs::remove_file(path);
+}
+
+/// A single-shard sharded driver must behave exactly like `probe_and_start`,
+/// which is what every other test in this file exercises.
+#[tokio::test(flavor = "multi_thread")]
+async fn sharded_driver_with_one_shard_matches_single_ring() {
+    let Some(driver) = sharded_driver_or_skip("sharded_driver_with_one_shard_matches_single_ring", 1) else {
+        return;
+    };
+    const LEN: usize = 1 << 20;
+    let content = make_content(LEN);
+    let (path, file) = temp_file_with(&content, "sharded-one");
+    let got = driver.read_at(Arc::clone(&file), 4096, 8192).await.expect("read");
+    assert_eq!(got, &content[4096..4096 + 8192]);
+    let snap = driver.shutdown();
+    assert_eq!(snap.delivered + snap.orphan_reclaimed, snap.submitted, "{snap:?}");
+    let _ = std::fs::remove_file(path);
 }

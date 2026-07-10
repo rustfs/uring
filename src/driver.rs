@@ -20,7 +20,7 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, TryRecvError};
 use std::task::{Context, Poll};
 use std::thread::JoinHandle;
@@ -240,7 +240,7 @@ struct DriverStats {
 }
 
 /// Point-in-time copy of the driver counters.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct StatsSnapshot {
     /// Read ops handed to the kernel.
     pub submitted: u64,
@@ -476,18 +476,57 @@ impl Drop for ReadHandle {
 }
 
 /// Process-level io_uring driver: one ring, one driver thread.
-pub struct UringDriver {
+/// One io_uring ring plus the thread that drives it.
+///
+/// Every cancel-safety invariant holds *per shard*, exactly as it did when a
+/// driver owned a single ring: this shard's pending table owns its buffers and
+/// fds until their CQEs, its permits are released only when a pending entry is
+/// dropped, and its bounded drain is what shutdown joins on. A `ReadHandle`
+/// carries the `tx` and `wake` of the shard that accepted it, so a cancel or a
+/// deferred submission always routes back to that same shard.
+struct Shard {
     tx: mpsc::Sender<Msg>,
     handle: Option<JoinHandle<()>>,
     stats: Arc<DriverStats>,
-    next_id: AtomicU64,
-    /// Backpressure permits (one per allowed in-flight op). Closed when the
-    /// driver exits so any waiting `ReadHandle` resolves with a driver-gone
-    /// error instead of hanging (rustfs/backlog#1102).
+    /// Backpressure permits (one per allowed in-flight op on this ring). Closed
+    /// when the driver thread exits so any waiting `ReadHandle` resolves with a
+    /// driver-gone error instead of hanging (rustfs/backlog#1102).
     sem: Arc<Semaphore>,
-    /// Signaled after every message send so the driver loop wakes immediately
+    /// Signaled after every message send so this shard's loop wakes immediately
     /// instead of waiting out the heartbeat (backlog#1102).
     wake_efd: Arc<EventFd>,
+}
+
+impl Shard {
+    /// Ask the shard's thread to drain and exit, then join it. Idempotent: the
+    /// `JoinHandle` is taken, so a later `Drop` is a no-op.
+    fn join(&mut self) {
+        if let Some(h) = self.handle.take() {
+            let _ = self.tx.send(Msg::Shutdown);
+            self.wake_efd.signal();
+            let _ = h.join();
+        }
+    }
+}
+
+impl Drop for Shard {
+    fn drop(&mut self) {
+        self.join();
+    }
+}
+
+pub struct UringDriver {
+    /// One or more independent rings. A cache-hit buffered read completes inline
+    /// inside `io_uring_enter`, so the thread driving a ring performs that
+    /// read's memcpy — which caps a single-ring driver at one core's memory
+    /// bandwidth (~5 GB/s measured, rustfs/backlog#1145). Sharding lifts that
+    /// ceiling roughly linearly while keeping the ring set per-disk, so a stalled
+    /// disk still cannot starve another disk's rings (rustfs/backlog#1055).
+    shards: Vec<Shard>,
+    next_id: AtomicU64,
+    /// Round-robin cursor for shard selection. Relaxed: it only has to spread
+    /// ops, never to order them.
+    rr: AtomicUsize,
 }
 
 impl UringDriver {
@@ -495,7 +534,51 @@ impl UringDriver {
     /// temp file before accepting work. `io_uring_setup` succeeding is not
     /// enough: gVisor/seccomp environments can create a ring whose ops then
     /// fail with ENOSYS/EINVAL (backlog#894 probe design).
+    /// Start a single-ring driver. Identical to `probe_and_start_sharded(entries, 1)`.
     pub fn probe_and_start(entries: u32) -> Result<Self, ProbeFailure> {
+        Self::probe_and_start_sharded(entries, 1)
+    }
+
+    /// Start a driver backed by `shards` independent rings, each with `entries`
+    /// SQ slots and its own driver thread.
+    ///
+    /// Use more than one shard when the workload hits the page cache: such reads
+    /// complete inline in `io_uring_enter`, so a single driver thread performs
+    /// every one of their memcpys and caps the driver at one core's memory
+    /// bandwidth. Measured on a 16-core host (rustfs/backlog#1145): 1 ring →
+    /// 4890 MB/s, 2 → 8969 MB/s, 4 → 15806 MB/s, with per-ring throughput flat.
+    /// Reads that miss the cache are device-bound and do not need sharding.
+    ///
+    /// In-flight ops are capped at `entries` *per shard* (the invariant that
+    /// makes CQ overflow structurally unreachable holds per ring), so the whole
+    /// driver admits up to `shards * entries` concurrent reads.
+    ///
+    /// `shards` is clamped to at least 1. Probing happens on the first shard, so
+    /// a restricted environment fails exactly as it does for a single ring; if a
+    /// later shard fails to start, the ones already running are shut down and
+    /// joined before the error is returned.
+    pub fn probe_and_start_sharded(entries: u32, shards: usize) -> Result<Self, ProbeFailure> {
+        let mut started = Vec::with_capacity(shards.max(1));
+        for _ in 0..shards.max(1) {
+            // `?` drops `started`, whose `Shard::drop` joins each running thread.
+            started.push(Self::start_shard(entries)?);
+        }
+        Ok(Self {
+            shards: started,
+            next_id: AtomicU64::new(1),
+            rr: AtomicUsize::new(0),
+        })
+    }
+
+    /// Pick the shard for the next op. Round-robin spreads the inline-completion
+    /// memcpy across driver threads; correctness does not depend on the choice,
+    /// because the handle remembers which shard took the op.
+    fn shard(&self) -> &Shard {
+        let n = self.shards.len();
+        &self.shards[self.rr.fetch_add(1, Ordering::Relaxed) % n]
+    }
+
+    fn start_shard(entries: u32) -> Result<Shard, ProbeFailure> {
         let mut ring = IoUring::new(entries).map_err(ProbeFailure::Setup)?;
         // Require the NODROP feature (kernel >= 5.5). Without it, CQ overflow
         // silently drops CQEs, stranding pending entries forever and hanging
@@ -530,11 +613,10 @@ impl UringDriver {
             .spawn(move || drive(ring, rx, thread_stats, thread_sem, cq_efd, thread_wake))
             .expect("spawn driver thread");
 
-        Ok(Self {
+        Ok(Shard {
             tx,
             handle: Some(handle),
             stats,
-            next_id: AtomicU64::new(1),
             sem,
             wake_efd,
         })
@@ -572,6 +654,13 @@ impl UringDriver {
         assert_eq!(id & CANCEL_BIT, 0, "op id overflowed into the cancel bit");
         let (done, rx) = oneshot::channel();
 
+        // Bind the op to one shard for its whole life: the permit, the message,
+        // the wake, and any later cancel all go to this ring. The handle holds
+        // clones of that shard's `tx`/`wake_efd`, so nothing can route a cancel
+        // to a ring whose pending table does not hold the op. The rejection paths
+        // below return an `Inert` handle that never sends, but still need a `tx`.
+        let shard = self.shard();
+
         // Reject an offset the kernel would answer with a runtime EINVAL that
         // must NOT be mistaken for an environment restriction (C7,
         // rustfs/backlog#1059). The kernel reads `off` as a signed loff_t, so
@@ -587,7 +676,7 @@ impl UringDriver {
             return ReadHandle {
                 id,
                 rx,
-                tx: self.tx.clone(),
+                tx: shard.tx.clone(),
                 finished: false,
                 cancel_on_drop: false,
                 state: HandleState::Inert,
@@ -608,7 +697,7 @@ impl UringDriver {
             return ReadHandle {
                 id,
                 rx,
-                tx: self.tx.clone(),
+                tx: shard.tx.clone(),
                 finished: false,
                 cancel_on_drop: false,
                 state: HandleState::Inert,
@@ -628,7 +717,7 @@ impl UringDriver {
                 return ReadHandle {
                     id,
                     rx,
-                    tx: self.tx.clone(),
+                    tx: shard.tx.clone(),
                     finished: false,
                     cancel_on_drop: false,
                     state: HandleState::Inert,
@@ -640,12 +729,12 @@ impl UringDriver {
         // released only when the pending entry is dropped at the CQE (C10,
         // rustfs/backlog#1060). Acquisition never blocks the caller's thread
         // (rustfs/backlog#1102).
-        match Arc::clone(&self.sem).try_acquire_owned() {
+        match Arc::clone(&shard.sem).try_acquire_owned() {
             // Fast path: a permit was free, so submit eagerly — no allocation,
             // no await, and the op is in flight the moment `submit` returns,
             // exactly as with the previous blocking implementation.
             Ok(permit) => {
-                if let Err(mpsc::SendError(msg)) = self.tx.send(Msg::Read {
+                if let Err(mpsc::SendError(msg)) = shard.tx.send(Msg::Read {
                     id,
                     file,
                     offset,
@@ -665,18 +754,18 @@ impl UringDriver {
                     return ReadHandle {
                         id,
                         rx,
-                        tx: self.tx.clone(),
+                        tx: shard.tx.clone(),
                         finished: false,
                         cancel_on_drop: false,
                         state: HandleState::Inert,
                     };
                 }
                 // Wake the driver loop so the read starts immediately.
-                self.wake_efd.signal();
+                shard.wake_efd.signal();
                 ReadHandle {
                     id,
                     rx,
-                    tx: self.tx.clone(),
+                    tx: shard.tx.clone(),
                     finished: false,
                     cancel_on_drop: true,
                     state: HandleState::Submitted,
@@ -688,17 +777,17 @@ impl UringDriver {
             Err(TryAcquireError::NoPermits) => ReadHandle {
                 id,
                 rx,
-                tx: self.tx.clone(),
+                tx: shard.tx.clone(),
                 finished: false,
                 cancel_on_drop: true,
                 state: HandleState::WaitingPermit {
-                    acquire: Box::pin(Arc::clone(&self.sem).acquire_owned()),
+                    acquire: Box::pin(Arc::clone(&shard.sem).acquire_owned()),
                     file,
                     offset,
                     len,
                     align,
                     done,
-                    wake: Arc::clone(&self.wake_efd),
+                    wake: Arc::clone(&shard.wake_efd),
                 },
             },
             // The driver has exited and closed the semaphore.
@@ -707,7 +796,7 @@ impl UringDriver {
                 ReadHandle {
                     id,
                     rx,
-                    tx: self.tx.clone(),
+                    tx: shard.tx.clone(),
                     finished: false,
                     cancel_on_drop: false,
                     state: HandleState::Inert,
@@ -716,34 +805,46 @@ impl UringDriver {
         }
     }
 
+    /// Counters summed across every shard. The conservation identities the
+    /// cancel-safety tests assert (`submitted == delivered + orphan_reclaimed`,
+    /// `in_flight == 0` after a clean drain) hold per shard, so they hold for
+    /// the sum.
     pub fn stats(&self) -> StatsSnapshot {
-        StatsSnapshot {
-            submitted: self.stats.submitted.load(Ordering::SeqCst),
-            delivered: self.stats.delivered.load(Ordering::SeqCst),
-            orphan_reclaimed: self.stats.orphan_reclaimed.load(Ordering::SeqCst),
-            in_flight: self.stats.in_flight.load(Ordering::SeqCst),
-            cancel_succeeded: self.stats.cancel_succeeded.load(Ordering::SeqCst),
-            cancel_not_found: self.stats.cancel_not_found.load(Ordering::SeqCst),
-            cancel_already: self.stats.cancel_already.load(Ordering::SeqCst),
-            cq_overflow: self.stats.cq_overflow.load(Ordering::SeqCst),
+        let mut snap = StatsSnapshot::default();
+        for shard in &self.shards {
+            let s = &shard.stats;
+            snap.submitted += s.submitted.load(Ordering::SeqCst);
+            snap.delivered += s.delivered.load(Ordering::SeqCst);
+            snap.orphan_reclaimed += s.orphan_reclaimed.load(Ordering::SeqCst);
+            snap.in_flight += s.in_flight.load(Ordering::SeqCst);
+            snap.cancel_succeeded += s.cancel_succeeded.load(Ordering::SeqCst);
+            snap.cancel_not_found += s.cancel_not_found.load(Ordering::SeqCst);
+            snap.cancel_already += s.cancel_already.load(Ordering::SeqCst);
+            snap.cq_overflow += s.cq_overflow.load(Ordering::SeqCst);
         }
+        snap
     }
 
-    /// Stop accepting work, cancel all in-flight ops, drain the ring to
-    /// `in_flight == 0`, then join the driver thread. Only after that is the
-    /// ring dropped/unmapped — the shutdown ordering P2 requires.
+    /// Stop accepting work, cancel all in-flight ops, drain every ring to
+    /// `in_flight == 0`, then join each driver thread. Only after that is a ring
+    /// dropped/unmapped — the shutdown ordering P2 requires, per shard.
+    ///
+    /// Shards are asked to stop first and joined afterwards, so their bounded
+    /// drains overlap instead of serializing `shards * DRAIN_TIMEOUT`.
     pub fn shutdown(mut self) -> StatsSnapshot {
-        let _ = self.tx.send(Msg::Shutdown);
-        self.wake_efd.signal();
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
+        for shard in &self.shards {
+            let _ = shard.tx.send(Msg::Shutdown);
+            shard.wake_efd.signal();
+        }
+        for shard in &mut self.shards {
+            shard.join();
         }
         let snap = self.stats();
-        // A clean drain leaves in_flight == 0. A non-zero count here means the
-        // bounded drain bailed out on a hung device and leaked the ring+buffers
-        // to stay memory-safe (C4, rustfs/backlog#1055) — a degraded but safe
-        // outcome, not a panic. Callers/tests that require a clean drain assert
-        // on the returned snapshot themselves.
+        // A clean drain leaves in_flight == 0. A non-zero count here means some
+        // shard's bounded drain bailed out on a hung device and leaked its
+        // ring+buffers to stay memory-safe (C4, rustfs/backlog#1055) — a degraded
+        // but safe outcome, not a panic. Callers/tests that require a clean drain
+        // assert on the returned snapshot themselves.
         if snap.in_flight != 0 {
             eprintln!(
                 "uring-spike shutdown: {} ops still in flight (bounded-drain bailout on a hung device)",
@@ -756,10 +857,16 @@ impl UringDriver {
 
 impl Drop for UringDriver {
     fn drop(&mut self) {
-        if let Some(h) = self.handle.take() {
-            let _ = self.tx.send(Msg::Shutdown);
-            self.wake_efd.signal();
-            let _ = h.join();
+        // Ask every shard to stop before joining any of them, so their bounded
+        // drains overlap. Dropping the `Vec<Shard>` would instead run each
+        // `Shard::drop` in turn, serializing up to `shards * DRAIN_TIMEOUT` on a
+        // hung device. `Shard::join` is idempotent, so the later drops are no-ops.
+        for shard in &self.shards {
+            let _ = shard.tx.send(Msg::Shutdown);
+            shard.wake_efd.signal();
+        }
+        for shard in &mut self.shards {
+            shard.join();
         }
     }
 }
