@@ -21,13 +21,14 @@ All notable changes to `rustfs-uring` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-The crate is **not published to crates.io** (`publish = false`); consumers pin a git revision.
-Because of that, entries are grouped under `[Unreleased]` until the first published release,
-and each one names the commit that landed it so a pin can be matched to a feature.
+**0.1.0 is publish-ready** — the metadata is complete and every dependency is on crates.io — but
+`publish = false` is kept until a maintainer cuts the crates.io release. Until then, consumers pin a
+git revision, so entries stay under `[Unreleased]` and each one names the commit that landed it. When
+0.1.0 is released, this whole section moves under a `## [0.1.0] - <date>` heading unchanged.
 
 ## [Unreleased]
 
-Everything below is in `main` and reachable by pinning the listed revision.
+Everything below is in `main`, will make up 0.1.0, and is reachable now by pinning the listed revision.
 
 ### Added
 
