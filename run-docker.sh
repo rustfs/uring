@@ -44,7 +44,7 @@ run_and_capture() {
         -e CARGO_TERM_COLOR=always \
         -w /spike \
         "$IMG" \
-        cargo test --release -- --nocapture --test-threads=1 2>&1
+        cargo test --release --features fault-injection -- --nocapture --test-threads=1 2>&1
 }
 
 echo "=================================================================="

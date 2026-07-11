@@ -290,6 +290,11 @@ enum Msg {
         id: u64,
     },
     Shutdown,
+    /// Test-only fault injection (rustfs/backlog#1103): unwind the driver thread
+    /// with ops in flight so the `DriverState::Drop` abort barrier (C2/#1054) is
+    /// exercised. Never present in a default build.
+    #[cfg(feature = "fault-injection")]
+    TestPanic,
 }
 
 /// One in-flight LOGICAL read. This struct — not the caller — owns everything
@@ -825,6 +830,17 @@ impl UringDriver {
         snap
     }
 
+    /// Test-only fault injection (rustfs/backlog#1103): poison one driver thread
+    /// so it panics with ops in flight, exercising the `DriverState::Drop` abort
+    /// barrier (C2/#1054). Compiled out entirely unless the `fault-injection`
+    /// feature is on — never in a default/production build.
+    #[cfg(feature = "fault-injection")]
+    pub fn test_inject_panic(&self) {
+        let shard = self.shard();
+        let _ = shard.tx.send(Msg::TestPanic);
+        shard.wake_efd.signal();
+    }
+
     /// Stop accepting work, cancel all in-flight ops, drain every ring to
     /// `in_flight == 0`, then join each driver thread. Only after that is a ring
     /// dropped/unmapped — the shutdown ordering P2 requires, per shard.
@@ -990,6 +1006,14 @@ fn drain_probe_cqe(ring: &mut IoUring) -> io::Result<i32> {
             Err(e) => return Err(e),
         }
         if let Some(cqe) = ring.completion().next() {
+            // fault-injection (backlog#1103 → C1/#1053): the real CQE has arrived,
+            // so the kernel is finished with the probe buffer. Forcing the error
+            // path here exercises probe_real_read's leak-over-UAF fallback with no
+            // live in-flight write to race.
+            #[cfg(feature = "fault-injection")]
+            if std::env::var_os("RUSTFS_URING_FAULT_PROBE_DRAIN").is_some() {
+                return Err(io::Error::other("fault-injection: forced probe drain failure"));
+            }
             return Ok(cqe.result());
         }
     }
@@ -1077,6 +1101,24 @@ fn drive(
     };
     let mut shutting_down = false;
     let mut drain_deadline: Option<Instant> = None;
+
+    // Bounded-drain deadline (C4, rustfs/backlog#1055). Production always uses the
+    // fixed DRAIN_TIMEOUT; a fault-injection build may shorten it via env so the
+    // leak-over-UAF escape hatch is testable without a 5 s wait (backlog#1103).
+    // Read once here (not per turn) so a `--test-threads=1` env toggle in one
+    // test never leaks into another's already-running driver thread.
+    #[cfg(not(feature = "fault-injection"))]
+    let drain_timeout = DRAIN_TIMEOUT;
+    #[cfg(feature = "fault-injection")]
+    let drain_timeout = std::env::var("RUSTFS_URING_FAULT_DRAIN_TIMEOUT_MS")
+        .ok()
+        .and_then(|ms| ms.parse().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(DRAIN_TIMEOUT);
+    // When set, drop an op's real completion on the floor so it stays pending and
+    // the bounded drain is forced onto its timeout path (backlog#1103 → C4/#1055).
+    #[cfg(feature = "fault-injection")]
+    let fault_stuck_drain = std::env::var_os("RUSTFS_URING_FAULT_STUCK_DRAIN").is_some();
 
     loop {
         // Block until a CQE is ready (the ring's registered eventfd), a new
@@ -1196,6 +1238,16 @@ fn drive(
                             .push_back(opcode::AsyncCancel::new(*id).build().user_data(*id | CANCEL_BIT));
                     }
                 }
+                #[cfg(feature = "fault-injection")]
+                Msg::TestPanic => {
+                    // Panic WITH buffers still in flight: the abort barrier in
+                    // `DriverState::Drop` must fire rather than let the unwind
+                    // free them under the kernel (rustfs/backlog#1103 → C2/#1054).
+                    panic!(
+                        "fault-injection: driver thread panic requested with {} ops in flight",
+                        state.pending.len()
+                    );
+                }
             }
         }
 
@@ -1242,6 +1294,15 @@ fn drive(
                     r if r == -libc::EALREADY => stats.cancel_already.fetch_add(1, Ordering::SeqCst),
                     _ => 0,
                 };
+                continue;
+            }
+            // fault-injection (backlog#1103 → C4/#1055): drop this real completion
+            // so the op stays pending and the bounded drain must take its
+            // DRAIN_TIMEOUT leak path. The CQE has already arrived, so the kernel
+            // is done with the buffer — the eventual `forget` leaks a completed
+            // allocation, never live memory.
+            #[cfg(feature = "fault-injection")]
+            if fault_stuck_drain && state.pending.contains_key(&ud) {
                 continue;
             }
             let res = cqe.result();
@@ -1340,7 +1401,7 @@ fn drive(
                 sem.close();
                 return; // clean drain: DriverState drops normally, ring unmaps.
             }
-            let deadline = *drain_deadline.get_or_insert_with(|| Instant::now() + DRAIN_TIMEOUT);
+            let deadline = *drain_deadline.get_or_insert_with(|| Instant::now() + drain_timeout);
             if Instant::now() >= deadline {
                 // A CQE may never arrive (ASYNC_CANCEL cannot interrupt an
                 // in-execution regular-file read on a hung disk). We must NOT
