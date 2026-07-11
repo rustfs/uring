@@ -82,6 +82,21 @@ fn aligned_geometry(offset: u64, len: usize, align: usize) -> Option<(u64, usize
 /// deadline is still checked and any queued cancel is picked up promptly.
 const LOOP_HEARTBEAT: Duration = Duration::from_millis(50);
 
+/// Heartbeat used when the shard is fully idle — no in-flight ops and not
+/// shutting down (rustfs/backlog#1169). New work still wakes the loop instantly
+/// via `wake_efd` and completions via the registered `cq_efd`; this only bounds
+/// the fallback wait, so a much longer value cuts idle timer/​syscall churn
+/// across many per-disk shards without affecting latency.
+const IDLE_HEARTBEAT: Duration = Duration::from_secs(1);
+
+/// Per-ring cap on io-wq BOUNDED workers (rustfs/backlog#1169). Cold buffered
+/// and O_DIRECT reads punted to io-wq each spawn a bounded worker, and the
+/// kernel default is min(sq_entries, 4*nCPU) PER ring — one ring per shard per
+/// disk can otherwise materialize thousands of PF_IO_WORKER threads under a
+/// cold-read burst. Best-effort (needs kernel >= 5.15); older kernels keep the
+/// default.
+const IOWQ_MAX_BOUNDED_WORKERS: u32 = 16;
+
 /// Consecutive non-transient `ring.submit()` failures the driver tolerates
 /// before it stops retrying silently and shuts the shard down, so callers get a
 /// driver-gone error and fall back to the std backend instead of stalling
@@ -665,6 +680,15 @@ impl UringDriver {
         ring.submitter()
             .register_eventfd(cq_efd.as_raw())
             .map_err(ProbeFailure::Setup)?;
+
+        // Cap the ring's io-wq bounded worker pool so a cold-read burst cannot
+        // materialize thousands of PF_IO_WORKER threads against the process's
+        // TasksMax/RLIMIT_NPROC (rustfs/backlog#1169). Best-effort: 0 leaves the
+        // unbounded pool unchanged, and a kernel without this op (< 5.15) keeps
+        // the default — neither is fatal to a working ring.
+        let mut iowq_max = [IOWQ_MAX_BOUNDED_WORKERS, 0u32];
+        let _ = ring.submitter().register_iowq_max_workers(&mut iowq_max);
+
         let wake_efd = Arc::new(EventFd::new().map_err(ProbeFailure::Setup)?);
         let thread_wake = Arc::clone(&wake_efd);
 
@@ -1263,7 +1287,17 @@ fn drive(
         // both eventfds after waking keeps them from staying spuriously
         // readable; a missed edge is harmless because the CQ/mpsc are re-checked
         // unconditionally below.
-        wait_for_events(&cq_efd, &wake_efd, LOOP_HEARTBEAT);
+        // Adaptive heartbeat (rustfs/backlog#1169): poll at 50 ms only while
+        // there is in-flight work to reap or a drain deadline to honor; when the
+        // shard is fully idle, wait up to IDLE_HEARTBEAT. New work still wakes us
+        // immediately via wake_efd and completions via cq_efd, so the longer idle
+        // wait only cuts timer/syscall churn.
+        let heartbeat = if shutting_down || !state.pending.is_empty() {
+            LOOP_HEARTBEAT
+        } else {
+            IDLE_HEARTBEAT
+        };
+        wait_for_events(&cq_efd, &wake_efd, heartbeat);
         cq_efd.drain();
         wake_efd.drain();
 
@@ -1403,47 +1437,53 @@ fn drive(
                 }
             }
         }
-        match state.ring.submit() {
-            Ok(_) => consecutive_submit_errors = 0,
-            Err(e) if e.raw_os_error() == Some(libc::EBUSY) => {
-                // CQ-overflow backpressure on pre-5.19 NODROP kernels: the
-                // kernel refuses new submissions until we reap. Keep the
-                // backlog and reap this turn instead of spinning (C5,
-                // rustfs/backlog#1056). Transient — not a submit failure.
-                consecutive_submit_errors = 0;
-            }
-            Err(e) if e.raw_os_error() == Some(libc::EINTR) => {
-                // A signal interrupted the enter and the SQEs were not consumed;
-                // retry on the next loop turn (transient).
-                consecutive_submit_errors = 0;
-            }
-            Err(e) => {
-                // Any other errno: the queued SQEs were not accepted, so their
-                // CQEs never arrive and their callers would hang. A brief run may
-                // be transient (EAGAIN under memory pressure); a persistent one
-                // (e.g. EPERM from a seccomp/LSM policy applied after startup)
-                // must NOT be retried forever in silence. Count it, log once, and
-                // after a bounded run of consecutive failures shut the shard down
-                // so the drain + bounded-drain bailout fail every pending caller
-                // with an error — they fall back to the std backend
-                // (rustfs/backlog#1162).
-                stats.submit_errors.fetch_add(1, Ordering::SeqCst);
-                consecutive_submit_errors += 1;
-                if !submit_error_logged {
-                    submit_error_logged = true;
-                    eprintln!("uring-spike driver: ring.submit() failed ({e}); retrying, will shut down if persistent");
+        // Skip the io_uring_enter syscall on a fully idle turn (rustfs/backlog#1169):
+        // an empty SQ has nothing to submit, yet a non-SQPOLL submit() still enters
+        // the kernel unconditionally. A non-empty SQ — freshly pushed, or residual
+        // after EBUSY — still submits.
+        if !state.ring.submission().is_empty() {
+            match state.ring.submit() {
+                Ok(_) => consecutive_submit_errors = 0,
+                Err(e) if e.raw_os_error() == Some(libc::EBUSY) => {
+                    // CQ-overflow backpressure on pre-5.19 NODROP kernels: the
+                    // kernel refuses new submissions until we reap. Keep the
+                    // backlog and reap this turn instead of spinning (C5,
+                    // rustfs/backlog#1056). Transient — not a submit failure.
+                    consecutive_submit_errors = 0;
                 }
-                if !shutting_down && consecutive_submit_errors >= MAX_CONSECUTIVE_SUBMIT_ERRORS {
-                    eprintln!(
-                        "uring-spike driver: {consecutive_submit_errors} consecutive submit failures; \
+                Err(e) if e.raw_os_error() == Some(libc::EINTR) => {
+                    // A signal interrupted the enter and the SQEs were not consumed;
+                    // retry on the next loop turn (transient).
+                    consecutive_submit_errors = 0;
+                }
+                Err(e) => {
+                    // Any other errno: the queued SQEs were not accepted, so their
+                    // CQEs never arrive and their callers would hang. A brief run may
+                    // be transient (EAGAIN under memory pressure); a persistent one
+                    // (e.g. EPERM from a seccomp/LSM policy applied after startup)
+                    // must NOT be retried forever in silence. Count it, log once, and
+                    // after a bounded run of consecutive failures shut the shard down
+                    // so the drain + bounded-drain bailout fail every pending caller
+                    // with an error — they fall back to the std backend
+                    // (rustfs/backlog#1162).
+                    stats.submit_errors.fetch_add(1, Ordering::SeqCst);
+                    consecutive_submit_errors += 1;
+                    if !submit_error_logged {
+                        submit_error_logged = true;
+                        eprintln!("uring-spike driver: ring.submit() failed ({e}); retrying, will shut down if persistent");
+                    }
+                    if !shutting_down && consecutive_submit_errors >= MAX_CONSECUTIVE_SUBMIT_ERRORS {
+                        eprintln!(
+                            "uring-spike driver: {consecutive_submit_errors} consecutive submit failures; \
                          shutting down so callers fall back to the std backend"
-                    );
-                    shutting_down = true;
-                    for id in state.pending.keys() {
-                        if queued_cancels.insert(*id) {
-                            state
-                                .backlog
-                                .push_back(opcode::AsyncCancel::new(*id).build().user_data(*id | CANCEL_BIT));
+                        );
+                        shutting_down = true;
+                        for id in state.pending.keys() {
+                            if queued_cancels.insert(*id) {
+                                state
+                                    .backlog
+                                    .push_back(opcode::AsyncCancel::new(*id).build().user_data(*id | CANCEL_BIT));
+                            }
                         }
                     }
                 }
