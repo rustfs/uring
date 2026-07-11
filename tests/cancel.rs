@@ -712,3 +712,52 @@ async fn sharded_driver_with_one_shard_matches_single_ring() {
     assert_eq!(snap.delivered + snap.orphan_reclaimed, snap.submitted, "{snap:?}");
     let _ = std::fs::remove_file(path);
 }
+
+/// Deterministic sharded cancel routing (backlog#1180). A `ReadHandle` carries
+/// the tx/wake of the shard that accepted its op, so a drop-cancel must reach
+/// THAT shard's ring. The existing sharded stress test cannot prove this: its
+/// dropped regular-file reads complete on their own, so a mis-routed cancel
+/// (answered -ENOENT) still conserves. Here every op is a blocked-pipe read that
+/// can ONLY finish by being canceled, and there is more than one op per shard, so
+/// a cancel that landed on the wrong ring would leave its read stuck and
+/// in_flight would never reach 0.
+#[tokio::test(flavor = "multi_thread")]
+async fn sharded_cancel_routes_to_the_owning_ring() {
+    const SHARDS: usize = 4;
+    // Comfortably more than SHARDS so round-robin gives every shard at least one.
+    const OPS: usize = 16;
+    let Some(driver) = sharded_driver_or_skip("sharded_cancel_routes_to_the_owning_ring", SHARDS) else {
+        return;
+    };
+    let (pipe_read, pipe_write) = os_pipe();
+
+    let mut handles = Vec::new();
+    for _ in 0..OPS {
+        handles.push(driver.read_current(Arc::clone(&pipe_read), 4096));
+    }
+    assert!(
+        wait_until(Duration::from_secs(2), || driver.stats().in_flight == OPS as u64).await,
+        "not all reads reached in-flight: {:?}",
+        driver.stats()
+    );
+
+    // Drop every handle: each sends AsyncCancel to the shard that accepted it.
+    drop(handles);
+
+    assert!(
+        wait_until(Duration::from_secs(3), || {
+            let s = driver.stats();
+            s.in_flight == 0 && s.orphan_reclaimed == OPS as u64
+        })
+        .await,
+        "sharded cancels did not reclaim every orphan — a cancel routed to the wrong ring? {:?}",
+        driver.stats()
+    );
+    // Blocked-pipe reads cannot complete on their own, so reclaiming every one
+    // proves the cancels — not a timeout — did it.
+    let snap = driver.stats();
+    assert!(snap.cancel_succeeded > 0, "orphans not reclaimed by cancel: {snap:?}");
+
+    drop(pipe_write);
+    driver.shutdown();
+}

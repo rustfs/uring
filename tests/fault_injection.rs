@@ -190,6 +190,63 @@ fn bounded_drain_bails_out_and_leaks_on_a_stuck_op() {
     drop(pipe_write);
 }
 
+/// #1161: the bounded-drain bailout must FAIL every stranded caller before it
+/// leaks the pending table, so a `ReadHandle` still awaited across the timeout
+/// resolves with an error instead of hanging forever. Same stuck-op seam as
+/// above, but this time the handle is kept and awaited after shutdown.
+#[test]
+fn stranded_handle_errors_after_bounded_drain_bailout() {
+    // SAFETY: `--test-threads=1` serializes tests; no concurrent env readers.
+    unsafe {
+        std::env::set_var("RUSTFS_URING_FAULT_STUCK_DRAIN", "1");
+        std::env::set_var("RUSTFS_URING_FAULT_DRAIN_TIMEOUT_MS", "400");
+    }
+
+    let driver = match UringDriver::probe_and_start(64) {
+        Ok(d) => d,
+        Err(e) => {
+            clear_stuck_env();
+            assert!(
+                e.is_expected_restriction(),
+                "probe failed OUTSIDE the expected restriction errno class: {e:?}"
+            );
+            eprintln!("SKIP stranded_handle_errors_after_bounded_drain_bailout: restricted environment ({e:?})");
+            return;
+        }
+    };
+
+    let (pipe_read, pipe_write) = os_pipe();
+    // Keep the handle (do not drop it): its oneshot receiver must still be live
+    // when the bailout runs so we can prove the bailout delivered an error.
+    let handle = driver.read_current(Arc::clone(&pipe_read), 4096).without_cancel_on_drop();
+    assert!(
+        wait_until(Duration::from_secs(2), || driver.stats().in_flight == 1),
+        "read never reached in-flight state"
+    );
+
+    // Drive the stuck op to the bounded-drain bailout.
+    let snap = driver.shutdown();
+    clear_stuck_env();
+    assert!(
+        snap.in_flight >= 1,
+        "the stuck op should still count as in flight after the leak-over-UAF bailout: {snap:?}"
+    );
+
+    // The still-awaited handle MUST resolve with an error within a bounded
+    // window — never hang (rustfs/backlog#1161). Before the fix the forgotten
+    // oneshot sender left this future pending forever and the timeout would fire.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("build current-thread runtime");
+    match rt.block_on(async { tokio::time::timeout(Duration::from_secs(2), handle).await }) {
+        Ok(Err(_)) => {} // driver-gone error delivered — correct.
+        Ok(Ok(_)) => panic!("stranded handle unexpectedly succeeded on a stuck op"),
+        Err(_) => panic!("stranded handle HUNG after bounded-drain bailout (rustfs/backlog#1161 regression)"),
+    }
+    drop(pipe_write);
+}
+
 fn clear_stuck_env() {
     // SAFETY: `--test-threads=1` teardown; no concurrent environment readers.
     unsafe {
@@ -234,6 +291,46 @@ fn probe_drain_failure_leaks_and_degrades() {
             // A subsequent NORMAL probe must still succeed — the forced fault did
             // not corrupt any global state.
             let driver = UringDriver::probe_and_start(64).expect("a normal probe after a forced-fault probe must still work");
+            let _ = driver.shutdown();
+        }
+    }
+}
+
+/// #1164: driver-thread spawn failure (EAGAIN under a cgroup pids-limit /
+/// RLIMIT_NPROC) must degrade to a `ProbeFailure` so the caller selects the std
+/// backend — never panic out of async disk init. The seam forces the spawn step
+/// to fail; the probe must return an error, not unwind, and leave global state
+/// intact for a later normal probe.
+#[test]
+fn spawn_failure_degrades_instead_of_panicking() {
+    // SAFETY: `--test-threads=1` serializes tests; no concurrent env readers.
+    unsafe {
+        std::env::set_var("RUSTFS_URING_FAULT_SPAWN", "1");
+    }
+    let result = UringDriver::probe_and_start_sharded(64, 3);
+    // SAFETY: `--test-threads=1` teardown.
+    unsafe {
+        std::env::remove_var("RUSTFS_URING_FAULT_SPAWN");
+    }
+
+    match result {
+        Ok(_) => panic!("driver started despite the forced spawn failure"),
+        Err(e) if e.is_expected_restriction() => {
+            // leg 1: io_uring was blocked before the probe reached the spawn seam.
+            eprintln!("SKIP spawn_failure_degrades_instead_of_panicking: restricted environment ({e:?})");
+        }
+        Err(e) => {
+            // leg 2: the forced EAGAIN propagated as a ProbeFailure (degrade, not
+            // panic). EAGAIN is not a restriction errno, so the caller logs an
+            // unexpected-probe warning and still falls back to the std backend.
+            assert!(
+                !e.is_expected_restriction(),
+                "forced spawn EAGAIN must not look like an environment restriction: {e:?}"
+            );
+            // A subsequent NORMAL probe must still succeed — the aborted start
+            // cleaned up any partially-started shard without corrupting state.
+            let driver =
+                UringDriver::probe_and_start_sharded(64, 2).expect("a normal probe after a forced spawn failure must still work");
             let _ = driver.shutdown();
         }
     }

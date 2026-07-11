@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io;
 use std::io::Write as _;
@@ -81,6 +81,33 @@ fn aligned_geometry(offset: u64, len: usize, align: usize) -> Option<(u64, usize
 /// (the wakeup eventfd); this timeout only bounds the wait so the bounded-drain
 /// deadline is still checked and any queued cancel is picked up promptly.
 const LOOP_HEARTBEAT: Duration = Duration::from_millis(50);
+
+/// Heartbeat used when the shard is fully idle — no in-flight ops and not
+/// shutting down (rustfs/backlog#1169). New work still wakes the loop instantly
+/// via `wake_efd` and completions via the registered `cq_efd`; this only bounds
+/// the fallback wait, so a much longer value cuts idle timer/​syscall churn
+/// across many per-disk shards without affecting latency.
+const IDLE_HEARTBEAT: Duration = Duration::from_secs(1);
+
+/// Per-ring cap on io-wq BOUNDED workers (rustfs/backlog#1169). Cold buffered
+/// and O_DIRECT reads punted to io-wq each spawn a bounded worker, and the
+/// kernel default is min(sq_entries, 4*nCPU) PER ring — one ring per shard per
+/// disk can otherwise materialize thousands of PF_IO_WORKER threads under a
+/// cold-read burst. Best-effort (needs kernel >= 5.15); older kernels keep the
+/// default.
+const IOWQ_MAX_BOUNDED_WORKERS: u32 = 16;
+
+/// Consecutive non-transient `ring.submit()` failures the driver tolerates
+/// before it stops retrying silently and shuts the shard down, so callers get a
+/// driver-gone error and fall back to the std backend instead of stalling
+/// forever on ops the kernel will never accept (rustfs/backlog#1162). With the
+/// 50 ms heartbeat this bounds the silent-retry window to a few seconds.
+const MAX_CONSECUTIVE_SUBMIT_ERRORS: u32 = 128;
+
+/// How many times a single logical read retries a transient CQE errno
+/// (EINTR/EAGAIN) without making progress before it surfaces the error, so a
+/// pathological storm cannot spin the driver thread (rustfs/backlog#1166).
+const MAX_TRANSIENT_RETRIES: u32 = 16;
 
 /// Owned `eventfd(2)` used to wake the driver loop (backlog#1102): one is
 /// registered with the ring so the kernel signals it on every CQE, the other is
@@ -237,6 +264,7 @@ struct DriverStats {
     cancel_not_found: AtomicU64,
     cancel_already: AtomicU64,
     cq_overflow: AtomicU64,
+    submit_errors: AtomicU64,
 }
 
 /// Point-in-time copy of the driver counters.
@@ -262,10 +290,19 @@ pub struct StatsSnapshot {
     /// signal that makes drain-to-zero non-terminating (C4,
     /// rustfs/backlog#1055).
     pub cancel_already: u64,
-    /// Kernel CQ-ring overflow counter. MUST stay 0: a non-zero value means
-    /// CQEs were lost, so their pending entries are never reclaimed and drain
-    /// never completes. Treated as fatal (C5, rustfs/backlog#1056).
+    /// Kernel CQ-ring overflow counter. With NODROP (asserted at probe) overflow
+    /// CQEs are buffered in the kernel overflow list and flushed on the next
+    /// enter, NOT lost — so a non-zero value is a backpressure warning, not fatal
+    /// loss (C5, rustfs/backlog#1056, #1167). In-flight is capped at `entries`
+    /// and cancels are deduped, keeping completions <= 2*entries, so it should
+    /// stay 0 in practice.
     pub cq_overflow: u64,
+    /// `ring.submit()` calls that returned a non-transient error. A rising count
+    /// means `io_uring_enter` is persistently failing (e.g. a seccomp/LSM policy
+    /// applied after startup); the driver shuts the shard down after a bounded
+    /// run of consecutive failures so callers fall back instead of stalling
+    /// (rustfs/backlog#1162).
+    pub submit_errors: u64,
 }
 
 enum Msg {
@@ -347,6 +384,33 @@ struct Pending {
     region_len: usize,
     /// `1` for buffered, the block size for `O_DIRECT`.
     align: usize,
+    /// Consecutive transient-errno (EINTR/EAGAIN) retries since the last byte of
+    /// progress, bounded by `MAX_TRANSIENT_RETRIES` so a storm cannot spin the
+    /// driver thread (rustfs/backlog#1166). Reset whenever a read makes progress.
+    transient_retries: u32,
+}
+
+impl Pending {
+    /// Build the read SQE for the not-yet-read remainder
+    /// `[pad + nread, pad + region_len)` at file offset `offset + nread`. This is
+    /// the single place a read SQE is constructed: the initial submit calls it
+    /// with `nread == 0` (the whole region), and a short-read or transient-errno
+    /// resubmit calls it after `nread` has advanced (rustfs/backlog#1058/#1166).
+    /// For an `O_DIRECT` read `pad + nread`, `offset + nread`, and the remaining
+    /// length are all block-aligned.
+    fn read_sqe(&self, ud: u64) -> io_uring::squeue::Entry {
+        let remaining = self.region_len - self.nread;
+        // SAFETY: `pad + nread < pad + region_len <= buf.len()`, and the buffer
+        // lives in the pending table until the CQE, so the kernel may write here.
+        // The read region is exclusively owned by this entry (no live aliases),
+        // so deriving a `*mut` from the shared `as_ptr` is sound.
+        let ptr = unsafe { self.buf.as_ptr().add(self.pad + self.nread).cast_mut() };
+        let next_off = self.offset + self.nread as u64;
+        opcode::Read::new(types::Fd(self.file.as_raw_fd()), ptr, remaining as u32)
+            .offset(next_off)
+            .build()
+            .user_data(ud)
+    }
 }
 
 /// Where a [`ReadHandle`] is in its lifecycle (rustfs/backlog#1102).
@@ -369,7 +433,12 @@ enum HandleState {
     },
     /// The op is with the driver: its buffer lives in the pending table and is
     /// reclaimed only at the CQE.
-    Submitted,
+    Submitted {
+        /// The accepting shard's wakeup eventfd, so a cancel sent on drop wakes
+        /// the driver loop now instead of after the heartbeat
+        /// (rustfs/backlog#1163).
+        wake: Arc<EventFd>,
+    },
 }
 
 /// Handle to a read. Await it for the result.
@@ -422,6 +491,13 @@ impl Future for ReadHandle {
                 this.finished = true;
                 return Poll::Ready(Err(io::Error::other("uring driver shut down")));
             };
+            // Clone the wake before moving the WaitingPermit out, so the new
+            // Submitted state carries it for the drop-cancel path
+            // (rustfs/backlog#1163).
+            let submitted_wake = match &this.state {
+                HandleState::WaitingPermit { wake, .. } => Arc::clone(wake),
+                _ => unreachable!("state was WaitingPermit"),
+            };
             let HandleState::WaitingPermit {
                 file,
                 offset,
@@ -430,7 +506,7 @@ impl Future for ReadHandle {
                 done,
                 wake,
                 ..
-            } = std::mem::replace(&mut this.state, HandleState::Submitted)
+            } = std::mem::replace(&mut this.state, HandleState::Submitted { wake: submitted_wake })
             else {
                 unreachable!("state was WaitingPermit")
             };
@@ -474,8 +550,23 @@ impl Drop for ReadHandle {
         // until the CQE. All we may do is ask the kernel to hurry up. A handle
         // dropped before it was submitted (Inert / WaitingPermit) has no buffer,
         // no permit and no SQE, so there is nothing to cancel.
-        if matches!(self.state, HandleState::Submitted) && !self.finished && self.cancel_on_drop {
+        if let HandleState::Submitted { wake } = &self.state
+            && !self.finished
+            && self.cancel_on_drop
+        {
+            // Close the receiver BEFORE waking the driver. The wake below
+            // makes the driver process the cancel immediately, possibly while
+            // this drop is still running — before the `rx` field is
+            // destroyed. Closing it first guarantees the cancel-induced
+            // completion the driver reaps is counted as an orphan reclaim, not
+            // delivered to a receiver that is about to drop anyway
+            // (rustfs/backlog#1163).
+            self.rx.close();
             let _ = self.tx.send(Msg::Cancel { id: self.id });
+            // Wake the loop so the cancel is queued now, not after the
+            // heartbeat. On an idle ring (the hung-disk case cancel-on-drop
+            // exists for) this keeps orphan reclamation prompt.
+            wake.signal();
         }
     }
 }
@@ -564,9 +655,14 @@ impl UringDriver {
     /// joined before the error is returned.
     pub fn probe_and_start_sharded(entries: u32, shards: usize) -> Result<Self, ProbeFailure> {
         let mut started = Vec::with_capacity(shards.max(1));
-        for _ in 0..shards.max(1) {
+        for i in 0..shards.max(1) {
+            // Probe only the first shard (rustfs/backlog#1165): the probe read
+            // exercises io_uring against the environment-global temp_dir, so one
+            // confirmation is representative. Shards 2..n only create a ring and
+            // verify NODROP — this avoids `shards - 1` extra O_TMPFILE
+            // create+write+read round-trips per disk on every start and renew.
             // `?` drops `started`, whose `Shard::drop` joins each running thread.
-            started.push(Self::start_shard(entries)?);
+            started.push(Self::start_shard(entries, i == 0)?);
         }
         Ok(Self {
             shards: started,
@@ -583,7 +679,7 @@ impl UringDriver {
         &self.shards[self.rr.fetch_add(1, Ordering::Relaxed) % n]
     }
 
-    fn start_shard(entries: u32) -> Result<Shard, ProbeFailure> {
+    fn start_shard(entries: u32, probe: bool) -> Result<Shard, ProbeFailure> {
         let mut ring = IoUring::new(entries).map_err(ProbeFailure::Setup)?;
         // Require the NODROP feature (kernel >= 5.5). Without it, CQ overflow
         // silently drops CQEs, stranding pending entries forever and hanging
@@ -592,7 +688,12 @@ impl UringDriver {
         if !ring.params().is_feature_nodrop() {
             return Err(ProbeFailure::Setup(io::Error::from_raw_os_error(libc::ENOSYS)));
         }
-        probe_real_read(&mut ring).map_err(ProbeFailure::ReadOp)?;
+        // Only the first shard runs the real-read probe (rustfs/backlog#1165); the
+        // rest still create a ring and check NODROP above, which is what makes
+        // io_uring usable, but skip the redundant temp_dir round-trip.
+        if probe {
+            probe_real_read(&mut ring).map_err(ProbeFailure::ReadOp)?;
+        }
 
         // Wake the driver loop on CQEs (kernel-signaled via a registered
         // eventfd) and on new messages (submit-signaled), replacing the 200 µs
@@ -603,6 +704,15 @@ impl UringDriver {
         ring.submitter()
             .register_eventfd(cq_efd.as_raw())
             .map_err(ProbeFailure::Setup)?;
+
+        // Cap the ring's io-wq bounded worker pool so a cold-read burst cannot
+        // materialize thousands of PF_IO_WORKER threads against the process's
+        // TasksMax/RLIMIT_NPROC (rustfs/backlog#1169). Best-effort: 0 leaves the
+        // unbounded pool unchanged, and a kernel without this op (< 5.15) keeps
+        // the default — neither is fatal to a working ring.
+        let mut iowq_max = [IOWQ_MAX_BOUNDED_WORKERS, 0u32];
+        let _ = ring.submitter().register_iowq_max_workers(&mut iowq_max);
+
         let wake_efd = Arc::new(EventFd::new().map_err(ProbeFailure::Setup)?);
         let thread_wake = Arc::clone(&wake_efd);
 
@@ -613,10 +723,24 @@ impl UringDriver {
         // (2*entries), so CQ overflow is structurally unreachable (C5/C10).
         let sem = Arc::new(Semaphore::new(entries as usize));
         let thread_sem = Arc::clone(&sem);
+        // Deterministic spawn-failure seam (rustfs/backlog#1164): exercise the
+        // degrade-not-panic path without a real cgroup pids-limit. Never present
+        // in a default build.
+        #[cfg(feature = "fault-injection")]
+        if std::env::var_os("RUSTFS_URING_FAULT_SPAWN").is_some() {
+            return Err(ProbeFailure::Setup(io::Error::from_raw_os_error(libc::EAGAIN)));
+        }
+
+        // Thread creation fails with EAGAIN under a cgroup pids-limit or
+        // RLIMIT_NPROC — exactly the constrained environments the probe/degrade
+        // design exists for. Degrade to the std backend instead of panicking out
+        // of async disk init/reconnect (rustfs/backlog#1164). The spawn happens
+        // after the probe read already drained, so on failure `ring`/`cq_efd`
+        // (moved into the closure) drop cleanly with no SQE in flight.
         let handle = std::thread::Builder::new()
             .name("uring-spike-driver".into())
             .spawn(move || drive(ring, rx, thread_stats, thread_sem, cq_efd, thread_wake))
-            .expect("spawn driver thread");
+            .map_err(ProbeFailure::Setup)?;
 
         Ok(Shard {
             tx,
@@ -709,15 +833,29 @@ impl UringDriver {
             };
         }
 
-        // Reject a bad O_DIRECT alignment, and a request whose block-aligned
-        // superset range would exceed the kernel's single-read cap
-        // (rustfs/backlog#1102). `align == 1` (buffered) always passes.
+        // Reject a bad O_DIRECT alignment, a request whose block-aligned superset
+        // range would exceed the kernel's single-read cap, and one whose aligned
+        // END crosses i64::MAX — the kernel reads pos as a signed loff_t, so
+        // `kernel_offset + region_len > i64::MAX` fails at runtime with
+        // EINVAL/EOVERFLOW, exactly the errno class the C7 guard must pre-empt at
+        // submit (rustfs/backlog#1102, #1166). Pre-empting it here also makes
+        // every resubmit's `next_off < kernel_offset + region_len` provably
+        // <= i64::MAX. `align == 1` (buffered) always passes the alignment part.
         match aligned_geometry(offset, len, align) {
-            Some((_, _, region_len)) if region_len <= MAX_READ_LEN => {}
+            // CURRENT_POSITION (stream) reads use no positional offset — the
+            // kernel reads from the current file position — so the i64::MAX end
+            // check does not apply to them (their sentinel offset would overflow
+            // it). Exempt them exactly as the offset guard above does.
+            Some((kernel_offset, _, region_len))
+                if region_len <= MAX_READ_LEN
+                    && (offset == CURRENT_POSITION
+                        || kernel_offset
+                            .checked_add(region_len as u64)
+                            .is_some_and(|end| end <= i64::MAX as u64)) => {}
             _ => {
                 let _ = done.send(Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "alignment must be a power of two and the block-aligned range must fit MAX_RW_COUNT",
+                    "alignment must be a power of two, and the block-aligned range must fit MAX_RW_COUNT and end within i64::MAX",
                 )));
                 return ReadHandle {
                     id,
@@ -773,7 +911,9 @@ impl UringDriver {
                     tx: shard.tx.clone(),
                     finished: false,
                     cancel_on_drop: true,
-                    state: HandleState::Submitted,
+                    state: HandleState::Submitted {
+                        wake: Arc::clone(&shard.wake_efd),
+                    },
                 }
             }
             // Saturated: `entries` ops are already in flight. Do NOT block the
@@ -826,6 +966,7 @@ impl UringDriver {
             snap.cancel_not_found += s.cancel_not_found.load(Ordering::SeqCst);
             snap.cancel_already += s.cancel_already.load(Ordering::SeqCst);
             snap.cq_overflow += s.cq_overflow.load(Ordering::SeqCst);
+            snap.submit_errors += s.submit_errors.load(Ordering::SeqCst);
         }
         snap
     }
@@ -996,13 +1137,38 @@ fn open_probe_file_exclusive(dir: &std::path::Path, pattern: &[u8]) -> io::Resul
 /// device from blocking forever; exhausting it returns an error that drives
 /// the caller's leak-over-UAF fallback.
 fn drain_probe_cqe(ring: &mut IoUring) -> io::Result<i32> {
-    const MAX_WAIT_ATTEMPTS: u32 = 4096;
-    for _ in 0..MAX_WAIT_ATTEMPTS {
-        match ring.submit_and_wait(1) {
+    // Bound the wait by WALL-CLOCK, not by an attempt count. `submit_and_wait(1)`
+    // parks in the kernel's io_cqring_wait until a CQE or a signal, so a single
+    // call can block forever when the probe read never completes — e.g. a
+    // temp_dir backed by a hung/D-state or NFS device. Since this runs on the
+    // caller's (async disk-init) thread, an unbounded block hangs startup. On
+    // kernels with EXT_ARG (>= 5.11) pass a timeout to the enter; on older
+    // kernels fall back to the blocking wait, whose only real risk is a hung
+    // temp_dir (rare) and which the deadline still re-checks between returns
+    // (rustfs/backlog#1165). On expiry, error out so the caller's leak-over-UAF
+    // fallback degrades the disk to the std backend instead of hanging.
+    const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+    let deadline = Instant::now() + PROBE_TIMEOUT;
+    let ext_arg = ring.params().is_feature_ext_arg();
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::other("probe: no CQE within the bounded wait"));
+        }
+        let waited = if ext_arg {
+            let ts = types::Timespec::new().sec(remaining.as_secs()).nsec(remaining.subsec_nanos());
+            let args = types::SubmitArgs::new().timespec(&ts);
+            ring.submitter().submit_with_args(1, &args)
+        } else {
+            ring.submit_and_wait(1)
+        };
+        match waited {
             Ok(_) => {}
-            // Signal interrupted the wait; the SQE is already in flight, so
-            // just wait again (do NOT re-push).
+            // Signal interrupted the wait; the SQE is already in flight, so wait
+            // again (do NOT re-push). The deadline still bounds the total time.
             Err(e) if e.raw_os_error() == Some(libc::EINTR) => {}
+            // EXT_ARG timeout elapsed with no CQE: loop to re-check the deadline.
+            Err(e) if e.raw_os_error() == Some(libc::ETIME) => {}
             Err(e) => return Err(e),
         }
         if let Some(cqe) = ring.completion().next() {
@@ -1017,7 +1183,6 @@ fn drain_probe_cqe(ring: &mut IoUring) -> io::Result<i32> {
             return Ok(cqe.result());
         }
     }
-    Err(io::Error::other("probe: no CQE after bounded wait"))
 }
 
 /// Owns everything the kernel can still be writing into: the ring, the
@@ -1056,6 +1221,15 @@ impl Drop for DriverState {
     }
 }
 
+/// Best-effort file length via `fstat` on the driver thread, used to tell a
+/// genuine O_DIRECT tail short read from a non-block-multiple short read that
+/// happened mid-file on a stacked filesystem (rustfs/backlog#1168). `None` when
+/// the stat fails, in which case the caller keeps the conservative EOF
+/// assumption rather than risk a wrong error or an unbounded resubmit loop.
+fn file_len(file: &File) -> Option<u64> {
+    file.metadata().ok().map(|m| m.len())
+}
+
 /// Hand the caller exactly the logical range `[head, head + want)` of the read
 /// region, truncated to what was actually read (rustfs/backlog#1102).
 ///
@@ -1086,6 +1260,79 @@ enum ReapStep {
     Resubmit(io_uring::squeue::Entry),
 }
 
+/// Queue at most one `AsyncCancel` per op (rustfs/backlog#1167): a drop-cancel
+/// followed by a shutdown, or the submit-error shutdown, must not enqueue a
+/// second cancel for the same id. The set is bounded by the pending table
+/// because ids are monotonic and an entry is removed when its op is reaped.
+fn queue_cancel(backlog: &mut VecDeque<io_uring::squeue::Entry>, queued_cancels: &mut HashSet<u64>, id: u64) {
+    if queued_cancels.insert(id) {
+        backlog.push_back(opcode::AsyncCancel::new(id).build().user_data(id | CANCEL_BIT));
+    }
+}
+
+/// Push as much of the backlog into the SQ as fits, stopping when the ring is
+/// full (the remainder retries next turn).
+fn flush_backlog(ring: &mut IoUring, backlog: &mut VecDeque<io_uring::squeue::Entry>) {
+    let mut sq = ring.submission();
+    while let Some(sqe) = backlog.pop_front() {
+        // SAFETY: read SQEs point into `pending`-owned buffers that live until
+        // their CQE; cancel SQEs carry no pointers.
+        if unsafe { sq.push(&sqe) }.is_err() {
+            backlog.push_front(sqe);
+            break;
+        }
+    }
+}
+
+/// Flush the backlog into the SQ and submit it, with submit-error classification
+/// (rustfs/backlog#1162). The single submit path for the whole loop: called once
+/// after intake and once more after reap when resubmits were queued. Skips the
+/// `io_uring_enter` syscall on an empty SQ (rustfs/backlog#1169). EINTR/EBUSY are
+/// transient; any other errno is counted and, after a bounded run, transitions
+/// the shard to shutdown so callers fall back to the std backend.
+fn submit_ring(
+    state: &mut DriverState,
+    stats: &DriverStats,
+    consecutive_submit_errors: &mut u32,
+    submit_error_logged: &mut bool,
+    shutting_down: &mut bool,
+    queued_cancels: &mut HashSet<u64>,
+) {
+    flush_backlog(&mut state.ring, &mut state.backlog);
+    if state.ring.submission().is_empty() {
+        return;
+    }
+    match state.ring.submit() {
+        Ok(_) => *consecutive_submit_errors = 0,
+        // CQ-overflow backpressure (EBUSY) and signal interruption (EINTR) are
+        // transient — retry next turn without counting them (C5, backlog#1056).
+        Err(e) if matches!(e.raw_os_error(), Some(libc::EBUSY) | Some(libc::EINTR)) => *consecutive_submit_errors = 0,
+        Err(e) => {
+            // The queued SQEs were not accepted, so their CQEs never arrive. A
+            // brief run may be transient (EAGAIN); a persistent one (e.g. EPERM
+            // from a seccomp/LSM policy applied after startup) must not be retried
+            // forever in silence.
+            stats.submit_errors.fetch_add(1, Ordering::SeqCst);
+            *consecutive_submit_errors += 1;
+            if !*submit_error_logged {
+                *submit_error_logged = true;
+                eprintln!("uring-spike driver: ring.submit() failed ({e}); retrying, will shut down if persistent");
+            }
+            if !*shutting_down && *consecutive_submit_errors >= MAX_CONSECUTIVE_SUBMIT_ERRORS {
+                eprintln!(
+                    "uring-spike driver: {} consecutive submit failures; shutting down so callers fall back to the std backend",
+                    *consecutive_submit_errors
+                );
+                *shutting_down = true;
+                let ids: Vec<u64> = state.pending.keys().copied().collect();
+                for id in ids {
+                    queue_cancel(&mut state.backlog, queued_cancels, id);
+                }
+            }
+        }
+    }
+}
+
 fn drive(
     ring: IoUring,
     rx: mpsc::Receiver<Msg>,
@@ -1101,6 +1348,16 @@ fn drive(
     };
     let mut shutting_down = false;
     let mut drain_deadline: Option<Instant> = None;
+    // Consecutive non-transient submit failures, and a once-only log latch, for
+    // the persistent-submit-failure escape hatch (rustfs/backlog#1162).
+    let mut consecutive_submit_errors: u32 = 0;
+    let mut submit_error_logged = false;
+    // Ids with an AsyncCancel already queued, so a drop-cancel followed by a
+    // shutdown (or vice versa) does not enqueue a second cancel for the same op —
+    // keeping total completions <= 2*entries and CQ overflow unreachable
+    // (rustfs/backlog#1167). Ids are monotonic, so an entry is removed only when
+    // its pending op is reaped; the set stays bounded by the pending table.
+    let mut queued_cancels: HashSet<u64> = HashSet::new();
 
     // Bounded-drain deadline (C4, rustfs/backlog#1055). Production always uses the
     // fixed DRAIN_TIMEOUT; a fault-injection build may shorten it via env so the
@@ -1127,7 +1384,17 @@ fn drive(
         // both eventfds after waking keeps them from staying spuriously
         // readable; a missed edge is harmless because the CQ/mpsc are re-checked
         // unconditionally below.
-        wait_for_events(&cq_efd, &wake_efd, LOOP_HEARTBEAT);
+        // Adaptive heartbeat (rustfs/backlog#1169): poll at 50 ms only while
+        // there is in-flight work to reap or a drain deadline to honor; when the
+        // shard is fully idle, wait up to IDLE_HEARTBEAT. New work still wakes us
+        // immediately via wake_efd and completions via cq_efd, so the longer idle
+        // wait only cuts timer/syscall churn.
+        let heartbeat = if shutting_down || !state.pending.is_empty() {
+            LOOP_HEARTBEAT
+        } else {
+            IDLE_HEARTBEAT
+        };
+        wait_for_events(&cq_efd, &wake_efd, heartbeat);
         cq_efd.drain();
         wake_efd.drain();
 
@@ -1178,7 +1445,7 @@ fn drive(
                             continue;
                         }
                     };
-                    let mut buf = vec![0u8; cap];
+                    let buf = vec![0u8; cap];
                     let pad = buf.as_ptr().align_offset(align);
                     // Runtime guard (not a debug-only assert): if the allocator
                     // ever returned a block `align_offset` cannot satisfy, refuse
@@ -1189,18 +1456,12 @@ fn drive(
                         continue;
                     }
 
-                    // The raw pointer is captured before `buf` moves into the
-                    // table; moving the Vec never relocates its heap block, and
-                    // the entry is only removed at the CQE. `region_len as u32`
-                    // is lossless: `submit` rejected anything > MAX_READ_LEN.
-                    //
-                    // SAFETY: `pad <= align - 1` and `pad + region_len <=
-                    // buf.len()`, so the pointer stays inside the allocation.
-                    let region_ptr = unsafe { buf.as_mut_ptr().add(pad) };
-                    let sqe = opcode::Read::new(types::Fd(file.as_raw_fd()), region_ptr, region_len as u32)
-                        .offset(kernel_offset)
-                        .build()
-                        .user_data(id);
+                    // Move the buffer into the pending table (which owns it until
+                    // the CQE), THEN build the SQE from the entry: the initial read
+                    // is `read_sqe` with `nread == 0`, so the read-region pointer
+                    // math and the `Read` builder live in exactly one place.
+                    // Moving the Vec never relocates its heap block, so the pointer
+                    // the SQE captures stays valid.
                     state.pending.insert(
                         id,
                         Pending {
@@ -1217,25 +1478,24 @@ fn drive(
                             want: len,
                             region_len,
                             align,
+                            transient_retries: 0,
                         },
                     );
+                    let sqe = state.pending.get(&id).expect("just inserted").read_sqe(id);
                     stats.submitted.fetch_add(1, Ordering::SeqCst);
                     stats.in_flight.fetch_add(1, Ordering::SeqCst);
                     state.backlog.push_back(sqe);
                 }
                 Msg::Cancel { id } => {
                     if state.pending.contains_key(&id) {
-                        state
-                            .backlog
-                            .push_back(opcode::AsyncCancel::new(id).build().user_data(id | CANCEL_BIT));
+                        queue_cancel(&mut state.backlog, &mut queued_cancels, id);
                     }
                 }
                 Msg::Shutdown => {
                     shutting_down = true;
-                    for id in state.pending.keys() {
-                        state
-                            .backlog
-                            .push_back(opcode::AsyncCancel::new(*id).build().user_data(*id | CANCEL_BIT));
+                    let ids: Vec<u64> = state.pending.keys().copied().collect();
+                    for id in ids {
+                        queue_cancel(&mut state.backlog, &mut queued_cancels, id);
                     }
                 }
                 #[cfg(feature = "fault-injection")]
@@ -1251,30 +1511,16 @@ fn drive(
             }
         }
 
-        // 2. Push backlog into the SQ (stop when full; retry next turn).
-        {
-            let mut sq = state.ring.submission();
-            while let Some(sqe) = state.backlog.pop_front() {
-                // SAFETY: read SQEs point into `pending`-owned buffers that
-                // live until their CQE; cancel SQEs carry no pointers.
-                if unsafe { sq.push(&sqe) }.is_err() {
-                    state.backlog.push_front(sqe);
-                    break;
-                }
-            }
-        }
-        match state.ring.submit() {
-            Ok(_) => {}
-            Err(e) if e.raw_os_error() == Some(libc::EBUSY) => {
-                // CQ-overflow backpressure on pre-5.19 NODROP kernels: the
-                // kernel refuses new submissions until we reap. Keep the
-                // backlog and reap this turn instead of spinning (C5,
-                // rustfs/backlog#1056).
-            }
-            Err(_) => {
-                // EINTR and friends: retry on the next loop turn.
-            }
-        }
+        // 2. Flush the backlog into the SQ and submit it (the single submit path;
+        //    see `submit_ring`).
+        submit_ring(
+            &mut state,
+            &stats,
+            &mut consecutive_submit_errors,
+            &mut submit_error_logged,
+            &mut shutting_down,
+            &mut queued_cancels,
+        );
 
         // 3. Reap. A Pending entry (and thus its buffer) is dropped ONLY when
         //    the logical read finishes; a short read is resubmitted for the
@@ -1315,13 +1561,34 @@ fn drive(
             let step = {
                 let p = state.pending.get_mut(&ud).expect("checked above");
                 if res < 0 {
-                    // Error (incl. ECANCELED) terminates the logical read.
-                    ReapStep::Finish(Err(io::Error::from_raw_os_error(-res)))
+                    let err = -res;
+                    // C7 three-class contract (rustfs/backlog#1166): a transient
+                    // errno (EINTR/EAGAIN) must be retried, not surfaced as the
+                    // read's final result — surfacing it would also discard the
+                    // already-read prefix of a resubmit. Bounded per logical read
+                    // so a storm cannot spin the driver thread. Streams
+                    // (CURRENT_POSITION) cannot resubmit positionally; ECANCELED
+                    // and every other errno terminate the logical read.
+                    let transient = err == libc::EINTR || err == libc::EAGAIN;
+                    if transient
+                        && p.offset != CURRENT_POSITION
+                        && p.nread < p.region_len
+                        && p.transient_retries < MAX_TRANSIENT_RETRIES
+                    {
+                        p.transient_retries += 1;
+                        ReapStep::Resubmit(p.read_sqe(ud))
+                    } else {
+                        // Error (incl. ECANCELED, or a transient errno past its
+                        // retry budget) terminates the logical read.
+                        ReapStep::Finish(Err(io::Error::from_raw_os_error(err)))
+                    }
                 } else if res == 0 {
                     // Real EOF: deliver whatever of the logical range was read.
                     ReapStep::Finish(Ok(deliver(p)))
                 } else {
                     p.nread += res as usize;
+                    // Progress resets the transient-retry budget (rustfs/backlog#1166).
+                    p.transient_retries = 0;
                     // Only POSITIONED reads (read_at / read_at_direct, whole-range
                     // pread contract) resubmit a short read. CURRENT_POSITION
                     // reads (read_current on pipes/streams) follow read(2)
@@ -1330,28 +1597,36 @@ fn drive(
                     // for stream data that may never come.
                     let is_stream = p.offset == CURRENT_POSITION;
                     let covered = p.nread >= p.head + p.want;
-                    // An O_DIRECT resubmit must stay block-aligned. The kernel
-                    // returns block multiples except at the file tail, so a
-                    // non-multiple means we reached EOF: stop and deliver.
-                    let unaligned_tail = p.align > 1 && !p.nread.is_multiple_of(p.align);
-                    if is_stream || covered || unaligned_tail || p.nread >= p.region_len {
+                    if is_stream || covered || p.nread >= p.region_len {
                         ReapStep::Finish(Ok(deliver(p)))
+                    } else if p.align > 1 && !p.nread.is_multiple_of(p.align) {
+                        // O_DIRECT non-block-multiple short read below the covered
+                        // range. The kernel returns block multiples EXCEPT at the
+                        // file tail — but a stacked filesystem (NFS/FUSE, or a
+                        // signal-split direct I/O) can legally return a non-multiple
+                        // mid-file, and assuming EOF there would silently truncate
+                        // the delivered range. Disambiguate with the actual file
+                        // length instead of inferring it (rustfs/backlog#1168).
+                        match file_len(&p.file) {
+                            // Genuine tail: at or past EOF — deliver what we read.
+                            Some(len) if p.offset + p.nread as u64 >= len => ReapStep::Finish(Ok(deliver(p))),
+                            // Mid-file non-multiple: an O_DIRECT read cannot resubmit
+                            // from a non-block-aligned offset, so surface an error
+                            // rather than truncate. The integration falls back to
+                            // the std backend for this read, preserving correctness.
+                            Some(_) => ReapStep::Finish(Err(io::Error::other(
+                                "io_uring O_DIRECT: non-block-aligned short read before EOF",
+                            ))),
+                            // fstat failed: keep the conservative EOF assumption
+                            // rather than risk a wrong error or an infinite loop.
+                            None => ReapStep::Finish(Ok(deliver(p))),
+                        }
                     } else {
-                        // Positioned short read, not EOF: resubmit the remainder
-                        // into the read region. The buffer stays owned by the
-                        // driver and in_flight is unchanged — one logical op.
-                        // For a direct read, `pad + nread` and `offset + nread`
-                        // are both block-aligned, as is `remaining`.
-                        let remaining = p.region_len - p.nread;
-                        // SAFETY: `pad + nread < pad + region_len <= buf.len()`,
-                        // and the buffer lives in the pending table until the CQE.
-                        let ptr = unsafe { p.buf.as_mut_ptr().add(p.pad + p.nread) };
-                        let next_off = p.offset + p.nread as u64;
-                        let sqe = opcode::Read::new(types::Fd(p.file.as_raw_fd()), ptr, remaining as u32)
-                            .offset(next_off)
-                            .build()
-                            .user_data(ud);
-                        ReapStep::Resubmit(sqe)
+                        // Positioned short read, not EOF, block-aligned: resubmit
+                        // the remainder into the read region. The buffer stays
+                        // owned by the driver and in_flight is unchanged — one
+                        // logical op.
+                        ReapStep::Resubmit(p.read_sqe(ud))
                     }
                 }
             };
@@ -1371,6 +1646,10 @@ fn drive(
                         Err(_) => stats.orphan_reclaimed.fetch_add(1, Ordering::SeqCst),
                     };
                     stats.in_flight.fetch_sub(1, Ordering::SeqCst);
+                    // Drop any queued-cancel bookkeeping for this now-gone op so
+                    // the dedup set stays bounded by the pending table
+                    // (rustfs/backlog#1167).
+                    queued_cancels.remove(&ud);
                     // `p` (and with it `_permit`) is dropped here, at the CQE
                     // and pending-table removal — never at future drop (C10,
                     // rustfs/backlog#1060). No manual release to forget.
@@ -1379,15 +1658,31 @@ fn drive(
             }
         }
 
-        // Monitor CQ overflow. With NODROP (asserted at probe) the crate's
-        // submit() auto-flushes the kernel overflow list, so this should stay
-        // 0; any non-zero value means CQEs were lost — pending entries would
-        // never be reclaimed. Record it as a fatal signal (C5,
-        // rustfs/backlog#1056).
+        // A short-read resubmit queued during reap must reach the kernel in THIS
+        // turn, not wait out the next heartbeat (rustfs/backlog#1163). Reap runs
+        // after the submit above, so re-run the single submit path when reap left
+        // work in the backlog; an idle turn leaves it empty and skips the call.
+        if !state.backlog.is_empty() {
+            submit_ring(
+                &mut state,
+                &stats,
+                &mut consecutive_submit_errors,
+                &mut submit_error_logged,
+                &mut shutting_down,
+                &mut queued_cancels,
+            );
+        }
+
+        // Monitor CQ overflow. With NODROP (asserted at probe) overflowed CQEs
+        // are BUFFERED in the kernel overflow list and flushed on the next enter,
+        // never lost — so a non-zero value is a backpressure warning, not fatal
+        // loss (rustfs/backlog#1056, #1167). In-flight reads are capped at
+        // `entries` and cancels are deduped (at most one per op), keeping total
+        // completions <= 2*entries, so this should stay 0 in practice.
         let overflow = state.ring.completion().overflow();
         if overflow != 0 {
             stats.cq_overflow.store(overflow as u64, Ordering::SeqCst);
-            eprintln!("uring-spike driver: CQ overflow = {overflow}; CQEs lost — treat as fatal in P2");
+            eprintln!("uring-spike driver: CQ overflow = {overflow}; CQEs buffered (NODROP), not lost — backpressure warning");
         }
 
         // 4. Exit when drained: the kernel no longer references any buffer, so
@@ -1412,10 +1707,30 @@ fn drive(
                      leaking ring + buffers to stay memory-safe",
                     state.pending.len()
                 );
-                // Close the semaphore so any handle awaiting a permit resolves
-                // with a driver-gone error. The leaked pending entries keep
-                // their permits, which is fine: nothing will wait on them.
+                // Fail every stranded caller BEFORE leaking the pending table.
+                // `oneshot::Sender::send` consumes the sender and never touches
+                // `p.buf`, so the kernel-owned buffer stays allocated (leak over
+                // UAF preserved) while an awaited `ReadHandle` resolves with an
+                // error instead of pending forever — every other driver-gone path
+                // already delivers an error, and this one must too
+                // (rustfs/backlog#1161).
+                for p in state.pending.values_mut() {
+                    if let Some(tx) = p.done.take() {
+                        let _ = tx.send(Err(io::Error::other("uring driver leaked op on bounded-drain timeout")));
+                    }
+                }
+                // Close the semaphore so any handle still awaiting a permit
+                // resolves with a driver-gone error too. The leaked pending
+                // entries keep their permits, which is fine: nothing waits on
+                // them any more.
                 sem.close();
+                // The leaked ring still has `cq_efd` registered via
+                // IORING_REGISTER_EVENTFD and in-flight ops that may post CQEs, so
+                // the eventfd must outlive it. Leak it alongside the ring instead
+                // of letting the returning `drive` drop (close) it out from under
+                // the still-mapped ring, honoring start_shard's documented "cq_efd
+                // outlives the ring" invariant on this exit too (rustfs/backlog#1167).
+                std::mem::forget(cq_efd);
                 std::mem::forget(state);
                 return;
             }

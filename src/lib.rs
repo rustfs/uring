@@ -30,12 +30,11 @@
 //!   unmapped.
 //!
 //! Status: read path only, Linux only. The driver supports positioned buffered
-//! reads, `O_DIRECT` reads with internal alignment, sharded rings, async
-//! backpressure, eventfd-driven reaping, graceful restricted-environment
-//! detection, and bounded shutdown drain. The write path is intentionally out
-//! of scope for `0.1.0`; see the
-//! [design notes](https://github.com/rustfs/uring/blob/v0.1.0/docs/DESIGN.md)
-//! for the invariant details.
+//! reads, `O_DIRECT` reads with internal alignment, stream (`read(2)`) reads,
+//! sharded rings, async backpressure, eventfd-driven reaping, graceful
+//! restricted-environment detection, and bounded shutdown drain. The write path
+//! is intentionally out of scope. See the crate README and the per-item docs
+//! below for the invariant details.
 
 #[cfg(target_os = "linux")]
 mod driver;

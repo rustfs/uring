@@ -7,40 +7,49 @@
 
 Cancel-safe async `io_uring` read backend for [RustFS](https://github.com/rustfs/rustfs) storage.
 
-This crate is the io_uring integration that RustFS's read path is built on. It started as the Spike 0 cancel-safety
-prototype ([rustfs/backlog#894](https://github.com/rustfs/backlog/issues/894)) and was hardened per
-the [#1048/#1051 audit](https://github.com/rustfs/backlog/issues/1051). It lives in its own repository so it can be
+This crate is the io_uring integration that RustFS's read path is built on. It lives in its own repository so it can be
 verified in isolation — with a real io_uring CI leg that the main `rustfs/rustfs` workspace cannot run — before being
-wired into the storage layer.
+wired into the storage layer behind a runtime probe.
 
-> **Status:** read path only, Linux only. The read path is wired into `rustfs/rustfs` behind a runtime probe and is
-> **off by default** (`RUSTFS_IO_URING_READ_ENABLE`). See [`CHANGELOG.md`](CHANGELOG.md) for what has landed and the
-> [design notes](https://github.com/rustfs/uring/blob/v0.1.0/docs/DESIGN.md) for the invariants.
+> **Status:** read path only, Linux only. On any other target the crate compiles to an empty stub. The read path is
+> wired into `rustfs/rustfs` behind a runtime probe and is **off by default** (`RUSTFS_IO_URING_READ_ENABLE`). What has
+> landed is in [`CHANGELOG.md`](CHANGELOG.md); the per-invariant rationale lives in the module and function docs on
+> [docs.rs](https://docs.rs/rustfs-uring/) and inline in `src/`.
 
 ```toml
 [target.'cfg(target_os = "linux")'.dependencies]
-rustfs-uring = "0.1.0"
+rustfs-uring = "0.2.0"
 ```
 
 ## The ownership model it enforces
 
 When a caller drops the future of an in-flight read (EC quorum reached, timeout, disconnect), the kernel may still write
 into the read buffer at any point until the CQE. Freeing the buffer at future-drop is a use-after-free. This crate
-proves and enforces the invariants any production io_uring integration must follow:
+enforces the invariants any production io_uring integration must follow:
 
 - **The buffer and the file handle are owned by the driver's pending (orphan) table** from SQE submission until the
   CQE — never by the caller's future.
-- **Dropping the future abandons only the result**; reclamation always happens at the CQE (optionally accelerated by
-  `IORING_OP_ASYNC_CANCEL`).
-- **Shutdown drains in-flight ops to zero** (with a bounded escape hatch for hung disks) before the ring is unmapped.
-- A driver-thread panic **aborts before freeing in-flight buffers** (leak over UAF); backpressure permits are released
-  at the CQE, not at future drop; short reads on positioned reads are resubmitted to satisfy the whole-range contract;
+- **Dropping the future abandons only the result**; reclamation always happens at the CQE, optionally accelerated by an
+  `IORING_OP_ASYNC_CANCEL` sent on drop.
+- **Shutdown drains in-flight ops to zero** before the ring is unmapped, with a bounded escape hatch for a hung disk:
+  on timeout it fails the stranded callers with an error and *leaks* the ring and its buffers rather than free memory
+  the kernel may still touch (leak over UAF).
+- A driver-thread panic **aborts the process before freeing in-flight buffers**; backpressure permits are released at
+  the CQE, not at future drop; a short read on a positioned read is resubmitted to satisfy the whole-range contract;
   the probe file is opened via `O_TMPFILE`.
 
-Each invariant holds **per shard** (see below), because a shard is an independent instance of the same driver.
+It also has a **degradation contract** — the reason it can ship default-on-probe safely:
 
-The full invariant list, the corrected fd-reuse mechanism, and the design constraints are in
-the [design notes](https://github.com/rustfs/uring/blob/v0.1.0/docs/DESIGN.md).
+- The startup probe runs a real `IORING_OP_READ` under a wall-clock timeout. A restricted environment
+  (seccomp / gVisor / old kernel) fails with a `ProbeFailure` whose `is_expected_restriction()` tells the caller to
+  degrade to the std backend quietly; an unexpected failure is surfaced, not hidden.
+- A persistently failing `io_uring_enter` is classified (not retried forever in silence): the shard shuts down so
+  callers fall back, and the failure count is visible in `StatsSnapshot`.
+- Transient CQE errnos (`EINTR`/`EAGAIN`) are retried; the whole-range and EOF contracts are honoured even on stacked
+  filesystems by disambiguating a short read with `fstat` rather than assuming EOF.
+
+Each invariant holds **per shard** (see below), because a shard is an independent instance of the same driver. Every
+one is pinned by an acceptance test (see [Testing](#testing)).
 
 ## Usage
 
@@ -50,9 +59,8 @@ use std::sync::Arc;
 use rustfs_uring::UringDriver;
 
 # async fn demo() -> std::io::Result<()> {
-    // Probe a real IORING_OP_READ before accepting work. A restricted environment
-    // (seccomp/gVisor/old kernel) returns a ProbeFailure whose
-    // `is_expected_restriction()` tells you to degrade to the std backend quietly.
+    // Probe a real IORING_OP_READ before accepting work. On a restricted host the
+    // ProbeFailure's `is_expected_restriction()` tells you to degrade quietly.
     let driver = UringDriver::probe_and_start(64).expect("io_uring available");
 
     let file = Arc::new(File::open("/data/object")?);
@@ -69,6 +77,17 @@ use rustfs_uring::UringDriver;
     #
 }
 ```
+
+Three read entry points, all returning an awaitable `ReadHandle`:
+
+- `read_at(file, offset, len)` — positioned (pread) read, whole-range: short reads are resubmitted until the range is
+  satisfied or a real EOF.
+- `read_at_direct(file, offset, len, align)` — the same, for an fd opened with `O_DIRECT` (see below).
+- `read_current(file, len)` — reads from the fd's current position with `read(2)` semantics: a short read is a valid
+  final result and is *not* resubmitted. Use it for pipes and other non-seekable fds.
+
+`ReadHandle::without_cancel_on_drop()` opts a handle out of the drop-time `ASYNC_CANCEL` when you know the op will
+complete on its own; and `driver.stats()` returns a `StatsSnapshot` at any time.
 
 ### Sharded rings
 
@@ -135,15 +154,19 @@ cargo test -- --nocapture --test-threads=1
 
 # Two legs in Docker (also runs on macOS via Docker Desktop / OrbStack):
 #   leg 1 — io_uring blocked by an explicit seccomp profile → the suite MUST
-#           degrade to a graceful skip (reproduces the #4313 restricted env);
+#           degrade to a graceful skip (reproduces a restricted environment);
 #   leg 2 — seccomp=unconfined → real io_uring, and NO test may skip.
 ./run-docker.sh
 ```
 
 The harness fails on either a non-degrading leg 1 or a vacuous-pass leg 2, so a skipped suite can never masquerade as
-real coverage. The 15 acceptance tests are the cancel-safety contract: buffer conservation under a mixed
-drop/keep stress across shards, an orphaned op reclaimed only at its CQE, bounded shutdown drain, `O_DIRECT` returning
-exact unaligned ranges, and backpressure deferring rather than blocking a runtime worker.
+real coverage. The cancel-safety contract is pinned by 16 acceptance tests in `tests/cancel.rs` — buffer conservation
+under a mixed drop/keep stress across shards, an orphaned op reclaimed only at its CQE, sharded cancel routed to the
+ring that owns the op, bounded shutdown drain, `O_DIRECT` returning exact unaligned ranges, and backpressure deferring
+rather than blocking a runtime worker. Five deterministic fault-injection tests in `tests/fault_injection.rs` (behind
+the test-only `fault-injection` feature, never compiled into a release build) drive the escape hatches: the
+panic-abort barrier, the bounded-drain leak-and-error path, a forced probe-drain failure, and a driver-thread spawn
+failure that must degrade rather than panic.
 
 ## Benchmarks
 
@@ -168,10 +191,9 @@ alone cannot tell a correct strategy from one reading the wrong offsets.
 - **`SQPOLL`.** Eliminates `io_uring_enter` under sustained load, at the cost of a kernel polling thread per ring —
   which multiplies by shards and by disks. Only for high-end deployments.
 
-Closed by measurement, not built — see [`CHANGELOG.md`](CHANGELOG.md#decisions-recorded-not-implemented): streaming
-reads through io_uring (NO-GO), `AsyncFd` reaping without a driver thread (would break the public API), a process-wide
-singleton ring (conflicts with per-disk isolation), and registered buffers (conflicts with the `Vec<u8>` ownership
-model, and the bottleneck is elsewhere).
+Closed by measurement, not built (see the CHANGELOG): streaming reads through io_uring (NO-GO), `AsyncFd` reaping
+without a driver thread (would break the public API), a process-wide singleton ring (conflicts with per-disk
+isolation), and registered buffers (conflicts with the `Vec<u8>` ownership model, and the bottleneck is elsewhere).
 
 ## License
 
