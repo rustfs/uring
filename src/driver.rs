@@ -604,9 +604,14 @@ impl UringDriver {
     /// joined before the error is returned.
     pub fn probe_and_start_sharded(entries: u32, shards: usize) -> Result<Self, ProbeFailure> {
         let mut started = Vec::with_capacity(shards.max(1));
-        for _ in 0..shards.max(1) {
+        for i in 0..shards.max(1) {
+            // Probe only the first shard (rustfs/backlog#1165): the probe read
+            // exercises io_uring against the environment-global temp_dir, so one
+            // confirmation is representative. Shards 2..n only create a ring and
+            // verify NODROP — this avoids `shards - 1` extra O_TMPFILE
+            // create+write+read round-trips per disk on every start and renew.
             // `?` drops `started`, whose `Shard::drop` joins each running thread.
-            started.push(Self::start_shard(entries)?);
+            started.push(Self::start_shard(entries, i == 0)?);
         }
         Ok(Self {
             shards: started,
@@ -623,7 +628,7 @@ impl UringDriver {
         &self.shards[self.rr.fetch_add(1, Ordering::Relaxed) % n]
     }
 
-    fn start_shard(entries: u32) -> Result<Shard, ProbeFailure> {
+    fn start_shard(entries: u32, probe: bool) -> Result<Shard, ProbeFailure> {
         let mut ring = IoUring::new(entries).map_err(ProbeFailure::Setup)?;
         // Require the NODROP feature (kernel >= 5.5). Without it, CQ overflow
         // silently drops CQEs, stranding pending entries forever and hanging
@@ -632,7 +637,12 @@ impl UringDriver {
         if !ring.params().is_feature_nodrop() {
             return Err(ProbeFailure::Setup(io::Error::from_raw_os_error(libc::ENOSYS)));
         }
-        probe_real_read(&mut ring).map_err(ProbeFailure::ReadOp)?;
+        // Only the first shard runs the real-read probe (rustfs/backlog#1165); the
+        // rest still create a ring and check NODROP above, which is what makes
+        // io_uring usable, but skip the redundant temp_dir round-trip.
+        if probe {
+            probe_real_read(&mut ring).map_err(ProbeFailure::ReadOp)?;
+        }
 
         // Wake the driver loop on CQEs (kernel-signaled via a registered
         // eventfd) and on new messages (submit-signaled), replacing the 200 µs
@@ -1053,13 +1063,38 @@ fn open_probe_file_exclusive(dir: &std::path::Path, pattern: &[u8]) -> io::Resul
 /// device from blocking forever; exhausting it returns an error that drives
 /// the caller's leak-over-UAF fallback.
 fn drain_probe_cqe(ring: &mut IoUring) -> io::Result<i32> {
-    const MAX_WAIT_ATTEMPTS: u32 = 4096;
-    for _ in 0..MAX_WAIT_ATTEMPTS {
-        match ring.submit_and_wait(1) {
+    // Bound the wait by WALL-CLOCK, not by an attempt count. `submit_and_wait(1)`
+    // parks in the kernel's io_cqring_wait until a CQE or a signal, so a single
+    // call can block forever when the probe read never completes — e.g. a
+    // temp_dir backed by a hung/D-state or NFS device. Since this runs on the
+    // caller's (async disk-init) thread, an unbounded block hangs startup. On
+    // kernels with EXT_ARG (>= 5.11) pass a timeout to the enter; on older
+    // kernels fall back to the blocking wait, whose only real risk is a hung
+    // temp_dir (rare) and which the deadline still re-checks between returns
+    // (rustfs/backlog#1165). On expiry, error out so the caller's leak-over-UAF
+    // fallback degrades the disk to the std backend instead of hanging.
+    const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+    let deadline = Instant::now() + PROBE_TIMEOUT;
+    let ext_arg = ring.params().is_feature_ext_arg();
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::other("probe: no CQE within the bounded wait"));
+        }
+        let waited = if ext_arg {
+            let ts = types::Timespec::new().sec(remaining.as_secs()).nsec(remaining.subsec_nanos());
+            let args = types::SubmitArgs::new().timespec(&ts);
+            ring.submitter().submit_with_args(1, &args)
+        } else {
+            ring.submit_and_wait(1)
+        };
+        match waited {
             Ok(_) => {}
-            // Signal interrupted the wait; the SQE is already in flight, so
-            // just wait again (do NOT re-push).
+            // Signal interrupted the wait; the SQE is already in flight, so wait
+            // again (do NOT re-push). The deadline still bounds the total time.
             Err(e) if e.raw_os_error() == Some(libc::EINTR) => {}
+            // EXT_ARG timeout elapsed with no CQE: loop to re-check the deadline.
+            Err(e) if e.raw_os_error() == Some(libc::ETIME) => {}
             Err(e) => return Err(e),
         }
         if let Some(cqe) = ring.completion().next() {
@@ -1074,7 +1109,6 @@ fn drain_probe_cqe(ring: &mut IoUring) -> io::Result<i32> {
             return Ok(cqe.result());
         }
     }
-    Err(io::Error::other("probe: no CQE after bounded wait"))
 }
 
 /// Owns everything the kernel can still be writing into: the ring, the
