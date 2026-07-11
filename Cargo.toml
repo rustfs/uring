@@ -25,7 +25,6 @@ readme = "README.md"
 homepage = "https://rustfs.com"
 keywords = ["io_uring", "async", "storage", "rustfs", "linux"]
 categories = ["asynchronous", "filesystem"]
-exclude = ["docs/**"]
 
 [features]
 # Test-only fault-injection seams (rustfs/backlog#1103). OFF by default and in
