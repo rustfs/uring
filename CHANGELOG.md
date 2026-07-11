@@ -23,13 +23,15 @@ aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-07-11
+
 ### Changed
 
 - Route the driver's runtime diagnostics (submit-error, CQ-overflow,
   bounded-drain, shutdown-timeout) through `tracing` with structured fields
   instead of `eprintln!`, unifying with the RustFS tracing pipeline for
   filterable observability. The panic-abort barrier keeps its direct `stderr`
-  write, since a subscriber may not flush before `abort()`.
+  write, since a subscriber may not flush before `abort()`. ([#13])
 
 ### Docs
 
@@ -37,7 +39,7 @@ aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (`read_at`, `read_at_direct`, `read_current`) and the degradation contract —
   and trimmed it to a lean front page: the per-invariant rationale lives inline
   in the module and function docs, not duplicated in prose. Removed the
-  `docs/DESIGN.md` design notes for a single source of truth.
+  `docs/DESIGN.md` design notes for a single source of truth. ([#13])
 
 ## [0.2.0] - 2026-07-11
 
@@ -219,9 +221,11 @@ built. They are listed so nobody re-opens them without new evidence.
 [#5]: https://github.com/rustfs/uring/pull/5
 [#6]: https://github.com/rustfs/uring/pull/6
 [#11]: https://github.com/rustfs/uring/pull/11
+[#13]: https://github.com/rustfs/uring/pull/13
 [rustfs/backlog#1051]: https://github.com/rustfs/backlog/issues/1051
 [rustfs/backlog#1144]: https://github.com/rustfs/backlog/issues/1144
 [rustfs/backlog#1159]: https://github.com/rustfs/backlog/issues/1159
-[Unreleased]: https://github.com/rustfs/uring/compare/0.2.0...HEAD
+[Unreleased]: https://github.com/rustfs/uring/compare/0.2.1...HEAD
+[0.2.1]: https://github.com/rustfs/uring/compare/0.2.0...0.2.1
 [0.2.0]: https://github.com/rustfs/uring/compare/0.1.0...0.2.0
 [0.1.0]: https://github.com/rustfs/uring/releases/tag/0.1.0
