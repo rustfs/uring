@@ -190,6 +190,63 @@ fn bounded_drain_bails_out_and_leaks_on_a_stuck_op() {
     drop(pipe_write);
 }
 
+/// #1161: the bounded-drain bailout must FAIL every stranded caller before it
+/// leaks the pending table, so a `ReadHandle` still awaited across the timeout
+/// resolves with an error instead of hanging forever. Same stuck-op seam as
+/// above, but this time the handle is kept and awaited after shutdown.
+#[test]
+fn stranded_handle_errors_after_bounded_drain_bailout() {
+    // SAFETY: `--test-threads=1` serializes tests; no concurrent env readers.
+    unsafe {
+        std::env::set_var("RUSTFS_URING_FAULT_STUCK_DRAIN", "1");
+        std::env::set_var("RUSTFS_URING_FAULT_DRAIN_TIMEOUT_MS", "400");
+    }
+
+    let driver = match UringDriver::probe_and_start(64) {
+        Ok(d) => d,
+        Err(e) => {
+            clear_stuck_env();
+            assert!(
+                e.is_expected_restriction(),
+                "probe failed OUTSIDE the expected restriction errno class: {e:?}"
+            );
+            eprintln!("SKIP stranded_handle_errors_after_bounded_drain_bailout: restricted environment ({e:?})");
+            return;
+        }
+    };
+
+    let (pipe_read, pipe_write) = os_pipe();
+    // Keep the handle (do not drop it): its oneshot receiver must still be live
+    // when the bailout runs so we can prove the bailout delivered an error.
+    let handle = driver.read_current(Arc::clone(&pipe_read), 4096).without_cancel_on_drop();
+    assert!(
+        wait_until(Duration::from_secs(2), || driver.stats().in_flight == 1),
+        "read never reached in-flight state"
+    );
+
+    // Drive the stuck op to the bounded-drain bailout.
+    let snap = driver.shutdown();
+    clear_stuck_env();
+    assert!(
+        snap.in_flight >= 1,
+        "the stuck op should still count as in flight after the leak-over-UAF bailout: {snap:?}"
+    );
+
+    // The still-awaited handle MUST resolve with an error within a bounded
+    // window — never hang (rustfs/backlog#1161). Before the fix the forgotten
+    // oneshot sender left this future pending forever and the timeout would fire.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("build current-thread runtime");
+    match rt.block_on(async { tokio::time::timeout(Duration::from_secs(2), handle).await }) {
+        Ok(Err(_)) => {} // driver-gone error delivered — correct.
+        Ok(Ok(_)) => panic!("stranded handle unexpectedly succeeded on a stuck op"),
+        Err(_) => panic!("stranded handle HUNG after bounded-drain bailout (rustfs/backlog#1161 regression)"),
+    }
+    drop(pipe_write);
+}
+
 fn clear_stuck_env() {
     // SAFETY: `--test-threads=1` teardown; no concurrent environment readers.
     unsafe {

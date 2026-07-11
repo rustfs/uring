@@ -1412,9 +1412,22 @@ fn drive(
                      leaking ring + buffers to stay memory-safe",
                     state.pending.len()
                 );
-                // Close the semaphore so any handle awaiting a permit resolves
-                // with a driver-gone error. The leaked pending entries keep
-                // their permits, which is fine: nothing will wait on them.
+                // Fail every stranded caller BEFORE leaking the pending table.
+                // `oneshot::Sender::send` consumes the sender and never touches
+                // `p.buf`, so the kernel-owned buffer stays allocated (leak over
+                // UAF preserved) while an awaited `ReadHandle` resolves with an
+                // error instead of pending forever — every other driver-gone path
+                // already delivers an error, and this one must too
+                // (rustfs/backlog#1161).
+                for p in state.pending.values_mut() {
+                    if let Some(tx) = p.done.take() {
+                        let _ = tx.send(Err(io::Error::other("uring driver leaked op on bounded-drain timeout")));
+                    }
+                }
+                // Close the semaphore so any handle still awaiting a permit
+                // resolves with a driver-gone error too. The leaked pending
+                // entries keep their permits, which is fine: nothing waits on
+                // them any more.
                 sem.close();
                 std::mem::forget(state);
                 return;
