@@ -89,6 +89,11 @@ const LOOP_HEARTBEAT: Duration = Duration::from_millis(50);
 /// 50 ms heartbeat this bounds the silent-retry window to a few seconds.
 const MAX_CONSECUTIVE_SUBMIT_ERRORS: u32 = 128;
 
+/// How many times a single logical read retries a transient CQE errno
+/// (EINTR/EAGAIN) without making progress before it surfaces the error, so a
+/// pathological storm cannot spin the driver thread (rustfs/backlog#1166).
+const MAX_TRANSIENT_RETRIES: u32 = 16;
+
 /// Owned `eventfd(2)` used to wake the driver loop (backlog#1102): one is
 /// registered with the ring so the kernel signals it on every CQE, the other is
 /// signaled by `submit`/shutdown so a new message wakes the loop immediately —
@@ -361,6 +366,10 @@ struct Pending {
     region_len: usize,
     /// `1` for buffered, the block size for `O_DIRECT`.
     align: usize,
+    /// Consecutive transient-errno (EINTR/EAGAIN) retries since the last byte of
+    /// progress, bounded by `MAX_TRANSIENT_RETRIES` so a storm cannot spin the
+    /// driver thread (rustfs/backlog#1166). Reset whenever a read makes progress.
+    transient_retries: u32,
 }
 
 /// Where a [`ReadHandle`] is in its lifecycle (rustfs/backlog#1102).
@@ -773,15 +782,29 @@ impl UringDriver {
             };
         }
 
-        // Reject a bad O_DIRECT alignment, and a request whose block-aligned
-        // superset range would exceed the kernel's single-read cap
-        // (rustfs/backlog#1102). `align == 1` (buffered) always passes.
+        // Reject a bad O_DIRECT alignment, a request whose block-aligned superset
+        // range would exceed the kernel's single-read cap, and one whose aligned
+        // END crosses i64::MAX — the kernel reads pos as a signed loff_t, so
+        // `kernel_offset + region_len > i64::MAX` fails at runtime with
+        // EINVAL/EOVERFLOW, exactly the errno class the C7 guard must pre-empt at
+        // submit (rustfs/backlog#1102, #1166). Pre-empting it here also makes
+        // every resubmit's `next_off < kernel_offset + region_len` provably
+        // <= i64::MAX. `align == 1` (buffered) always passes the alignment part.
         match aligned_geometry(offset, len, align) {
-            Some((_, _, region_len)) if region_len <= MAX_READ_LEN => {}
+            // CURRENT_POSITION (stream) reads use no positional offset — the
+            // kernel reads from the current file position — so the i64::MAX end
+            // check does not apply to them (their sentinel offset would overflow
+            // it). Exempt them exactly as the offset guard above does.
+            Some((kernel_offset, _, region_len))
+                if region_len <= MAX_READ_LEN
+                    && (offset == CURRENT_POSITION
+                        || kernel_offset
+                            .checked_add(region_len as u64)
+                            .is_some_and(|end| end <= i64::MAX as u64)) => {}
             _ => {
                 let _ = done.send(Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "alignment must be a power of two and the block-aligned range must fit MAX_RW_COUNT",
+                    "alignment must be a power of two, and the block-aligned range must fit MAX_RW_COUNT and end within i64::MAX",
                 )));
                 return ReadHandle {
                     id,
@@ -1312,6 +1335,7 @@ fn drive(
                             want: len,
                             region_len,
                             align,
+                            transient_retries: 0,
                         },
                     );
                     stats.submitted.fetch_add(1, Ordering::SeqCst);
@@ -1442,13 +1466,43 @@ fn drive(
             let step = {
                 let p = state.pending.get_mut(&ud).expect("checked above");
                 if res < 0 {
-                    // Error (incl. ECANCELED) terminates the logical read.
-                    ReapStep::Finish(Err(io::Error::from_raw_os_error(-res)))
+                    let err = -res;
+                    // C7 three-class contract (rustfs/backlog#1166): a transient
+                    // errno (EINTR/EAGAIN) must be retried, not surfaced as the
+                    // read's final result — surfacing it would also discard the
+                    // already-read prefix of a resubmit. Bounded per logical read
+                    // so a storm cannot spin the driver thread. Streams
+                    // (CURRENT_POSITION) cannot resubmit positionally; ECANCELED
+                    // and every other errno terminate the logical read.
+                    let transient = err == libc::EINTR || err == libc::EAGAIN;
+                    if transient
+                        && p.offset != CURRENT_POSITION
+                        && p.nread < p.region_len
+                        && p.transient_retries < MAX_TRANSIENT_RETRIES
+                    {
+                        p.transient_retries += 1;
+                        let remaining = p.region_len - p.nread;
+                        // SAFETY: `pad + nread < pad + region_len <= buf.len()`,
+                        // and the buffer lives in the pending table until the CQE.
+                        let ptr = unsafe { p.buf.as_mut_ptr().add(p.pad + p.nread) };
+                        let next_off = p.offset + p.nread as u64;
+                        let sqe = opcode::Read::new(types::Fd(p.file.as_raw_fd()), ptr, remaining as u32)
+                            .offset(next_off)
+                            .build()
+                            .user_data(ud);
+                        ReapStep::Resubmit(sqe)
+                    } else {
+                        // Error (incl. ECANCELED, or a transient errno past its
+                        // retry budget) terminates the logical read.
+                        ReapStep::Finish(Err(io::Error::from_raw_os_error(err)))
+                    }
                 } else if res == 0 {
                     // Real EOF: deliver whatever of the logical range was read.
                     ReapStep::Finish(Ok(deliver(p)))
                 } else {
                     p.nread += res as usize;
+                    // Progress resets the transient-retry budget (rustfs/backlog#1166).
+                    p.transient_retries = 0;
                     // Only POSITIONED reads (read_at / read_at_direct, whole-range
                     // pread contract) resubmit a short read. CURRENT_POSITION
                     // reads (read_current on pipes/streams) follow read(2)
