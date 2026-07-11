@@ -1173,6 +1173,15 @@ impl Drop for DriverState {
     }
 }
 
+/// Best-effort file length via `fstat` on the driver thread, used to tell a
+/// genuine O_DIRECT tail short read from a non-block-multiple short read that
+/// happened mid-file on a stacked filesystem (rustfs/backlog#1168). `None` when
+/// the stat fails, in which case the caller keeps the conservative EOF
+/// assumption rather than risk a wrong error or an unbounded resubmit loop.
+fn file_len(file: &File) -> Option<u64> {
+    file.metadata().ok().map(|m| m.len())
+}
+
 /// Hand the caller exactly the logical range `[head, head + want)` of the read
 /// region, truncated to what was actually read (rustfs/backlog#1102).
 ///
@@ -1525,18 +1534,36 @@ fn drive(
                     // for stream data that may never come.
                     let is_stream = p.offset == CURRENT_POSITION;
                     let covered = p.nread >= p.head + p.want;
-                    // An O_DIRECT resubmit must stay block-aligned. The kernel
-                    // returns block multiples except at the file tail, so a
-                    // non-multiple means we reached EOF: stop and deliver.
-                    let unaligned_tail = p.align > 1 && !p.nread.is_multiple_of(p.align);
-                    if is_stream || covered || unaligned_tail || p.nread >= p.region_len {
+                    if is_stream || covered || p.nread >= p.region_len {
                         ReapStep::Finish(Ok(deliver(p)))
+                    } else if p.align > 1 && !p.nread.is_multiple_of(p.align) {
+                        // O_DIRECT non-block-multiple short read below the covered
+                        // range. The kernel returns block multiples EXCEPT at the
+                        // file tail — but a stacked filesystem (NFS/FUSE, or a
+                        // signal-split direct I/O) can legally return a non-multiple
+                        // mid-file, and assuming EOF there would silently truncate
+                        // the delivered range. Disambiguate with the actual file
+                        // length instead of inferring it (rustfs/backlog#1168).
+                        match file_len(&p.file) {
+                            // Genuine tail: at or past EOF — deliver what we read.
+                            Some(len) if p.offset + p.nread as u64 >= len => ReapStep::Finish(Ok(deliver(p))),
+                            // Mid-file non-multiple: an O_DIRECT read cannot resubmit
+                            // from a non-block-aligned offset, so surface an error
+                            // rather than truncate. The integration falls back to
+                            // the std backend for this read, preserving correctness.
+                            Some(_) => ReapStep::Finish(Err(io::Error::other(
+                                "io_uring O_DIRECT: non-block-aligned short read before EOF",
+                            ))),
+                            // fstat failed: keep the conservative EOF assumption
+                            // rather than risk a wrong error or an infinite loop.
+                            None => ReapStep::Finish(Ok(deliver(p))),
+                        }
                     } else {
-                        // Positioned short read, not EOF: resubmit the remainder
-                        // into the read region. The buffer stays owned by the
-                        // driver and in_flight is unchanged — one logical op.
-                        // For a direct read, `pad + nread` and `offset + nread`
-                        // are both block-aligned, as is `remaining`.
+                        // Positioned short read, not EOF, block-aligned: resubmit
+                        // the remainder into the read region. The buffer stays
+                        // owned by the driver and in_flight is unchanged — one
+                        // logical op. For a direct read, `pad + nread` and
+                        // `offset + nread` are both block-aligned, as is `remaining`.
                         let remaining = p.region_len - p.nread;
                         // SAFETY: `pad + nread < pad + region_len <= buf.len()`,
                         // and the buffer lives in the pending table until the CQE.
