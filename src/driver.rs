@@ -383,7 +383,12 @@ enum HandleState {
     },
     /// The op is with the driver: its buffer lives in the pending table and is
     /// reclaimed only at the CQE.
-    Submitted,
+    Submitted {
+        /// The accepting shard's wakeup eventfd, so a cancel sent on drop wakes
+        /// the driver loop now instead of after the heartbeat
+        /// (rustfs/backlog#1163).
+        wake: Arc<EventFd>,
+    },
 }
 
 /// Handle to a read. Await it for the result.
@@ -436,6 +441,13 @@ impl Future for ReadHandle {
                 this.finished = true;
                 return Poll::Ready(Err(io::Error::other("uring driver shut down")));
             };
+            // Clone the wake before moving the WaitingPermit out, so the new
+            // Submitted state carries it for the drop-cancel path
+            // (rustfs/backlog#1163).
+            let submitted_wake = match &this.state {
+                HandleState::WaitingPermit { wake, .. } => Arc::clone(wake),
+                _ => unreachable!("state was WaitingPermit"),
+            };
             let HandleState::WaitingPermit {
                 file,
                 offset,
@@ -444,7 +456,7 @@ impl Future for ReadHandle {
                 done,
                 wake,
                 ..
-            } = std::mem::replace(&mut this.state, HandleState::Submitted)
+            } = std::mem::replace(&mut this.state, HandleState::Submitted { wake: submitted_wake })
             else {
                 unreachable!("state was WaitingPermit")
             };
@@ -488,8 +500,22 @@ impl Drop for ReadHandle {
         // until the CQE. All we may do is ask the kernel to hurry up. A handle
         // dropped before it was submitted (Inert / WaitingPermit) has no buffer,
         // no permit and no SQE, so there is nothing to cancel.
-        if matches!(self.state, HandleState::Submitted) && !self.finished && self.cancel_on_drop {
-            let _ = self.tx.send(Msg::Cancel { id: self.id });
+        if let HandleState::Submitted { wake } = &self.state {
+            if !self.finished && self.cancel_on_drop {
+                // Close the receiver BEFORE waking the driver. The wake below
+                // makes the driver process the cancel immediately, possibly while
+                // this drop is still running — before the `rx` field is
+                // destroyed. Closing it first guarantees the cancel-induced
+                // completion the driver reaps is counted as an orphan reclaim, not
+                // delivered to a receiver that is about to drop anyway
+                // (rustfs/backlog#1163).
+                self.rx.close();
+                let _ = self.tx.send(Msg::Cancel { id: self.id });
+                // Wake the loop so the cancel is queued now, not after the
+                // heartbeat. On an idle ring (the hung-disk case cancel-on-drop
+                // exists for) this keeps orphan reclamation prompt.
+                wake.signal();
+            }
         }
     }
 }
@@ -787,7 +813,9 @@ impl UringDriver {
                     tx: shard.tx.clone(),
                     finished: false,
                     cancel_on_drop: true,
-                    state: HandleState::Submitted,
+                    state: HandleState::Submitted {
+                        wake: Arc::clone(&shard.wake_efd),
+                    },
                 }
             }
             // Saturated: `entries` ops are already in flight. Do NOT block the
@@ -1428,6 +1456,29 @@ fn drive(
                 }
                 ReapStep::Resubmit(sqe) => state.backlog.push_back(sqe),
             }
+        }
+
+        // A short-read resubmit queued during reap must reach the kernel in THIS
+        // turn, not wait out the next heartbeat: reap runs after the earlier
+        // push+submit, so without this flush the remainder sits idle for up to
+        // LOOP_HEARTBEAT (rustfs/backlog#1163). Only the resubmit/backlog-residue
+        // case makes this non-empty, so a fully idle turn skips it.
+        if !state.backlog.is_empty() {
+            {
+                let mut sq = state.ring.submission();
+                while let Some(sqe) = state.backlog.pop_front() {
+                    // SAFETY: read SQEs point into `pending`-owned buffers that
+                    // live until their CQE; cancel SQEs carry no pointers.
+                    if unsafe { sq.push(&sqe) }.is_err() {
+                        state.backlog.push_front(sqe);
+                        break;
+                    }
+                }
+            }
+            // A persistent submit failure is already counted and acted on by the
+            // main submit above (rustfs/backlog#1162); this same-turn flush just
+            // retries opportunistically, so a transient error here is fine.
+            let _ = state.ring.submit();
         }
 
         // Monitor CQ overflow. With NODROP (asserted at probe) the crate's
