@@ -27,6 +27,14 @@ keywords = ["io_uring", "async", "storage", "rustfs", "linux"]
 categories = ["asynchronous", "filesystem"]
 exclude = ["docs/**"]
 
+[features]
+# Test-only fault-injection seams (rustfs/backlog#1103). OFF by default and in
+# every published/production build; enabled only by the test harness
+# (run-docker.sh) to drive the panic-abort, bounded-drain-timeout, and
+# probe-drain leak paths deterministically. All gated code is `#[cfg(feature =
+# "fault-injection")]`, so a default build compiles none of it.
+fault-injection = []
+
 [dependencies]
 tokio = { version = "1.52.3", default-features = false, features = ["sync"] }
 
