@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io;
 use std::io::Write as _;
@@ -275,9 +275,12 @@ pub struct StatsSnapshot {
     /// signal that makes drain-to-zero non-terminating (C4,
     /// rustfs/backlog#1055).
     pub cancel_already: u64,
-    /// Kernel CQ-ring overflow counter. MUST stay 0: a non-zero value means
-    /// CQEs were lost, so their pending entries are never reclaimed and drain
-    /// never completes. Treated as fatal (C5, rustfs/backlog#1056).
+    /// Kernel CQ-ring overflow counter. With NODROP (asserted at probe) overflow
+    /// CQEs are buffered in the kernel overflow list and flushed on the next
+    /// enter, NOT lost — so a non-zero value is a backpressure warning, not fatal
+    /// loss (C5, rustfs/backlog#1056, #1167). In-flight is capped at `entries`
+    /// and cancels are deduped, keeping completions <= 2*entries, so it should
+    /// stay 0 in practice.
     pub cq_overflow: u64,
     /// `ring.submit()` calls that returned a non-transient error. A rising count
     /// means `io_uring_enter` is persistently failing (e.g. a seccomp/LSM policy
@@ -1219,6 +1222,12 @@ fn drive(
     // the persistent-submit-failure escape hatch (rustfs/backlog#1162).
     let mut consecutive_submit_errors: u32 = 0;
     let mut submit_error_logged = false;
+    // Ids with an AsyncCancel already queued, so a drop-cancel followed by a
+    // shutdown (or vice versa) does not enqueue a second cancel for the same op —
+    // keeping total completions <= 2*entries and CQ overflow unreachable
+    // (rustfs/backlog#1167). Ids are monotonic, so an entry is removed only when
+    // its pending op is reaped; the set stays bounded by the pending table.
+    let mut queued_cancels: HashSet<u64> = HashSet::new();
 
     // Bounded-drain deadline (C4, rustfs/backlog#1055). Production always uses the
     // fixed DRAIN_TIMEOUT; a fault-injection build may shorten it via env so the
@@ -1343,7 +1352,8 @@ fn drive(
                     state.backlog.push_back(sqe);
                 }
                 Msg::Cancel { id } => {
-                    if state.pending.contains_key(&id) {
+                    // Dedup: at most one AsyncCancel per op (rustfs/backlog#1167).
+                    if state.pending.contains_key(&id) && queued_cancels.insert(id) {
                         state
                             .backlog
                             .push_back(opcode::AsyncCancel::new(id).build().user_data(id | CANCEL_BIT));
@@ -1352,9 +1362,11 @@ fn drive(
                 Msg::Shutdown => {
                     shutting_down = true;
                     for id in state.pending.keys() {
-                        state
-                            .backlog
-                            .push_back(opcode::AsyncCancel::new(*id).build().user_data(*id | CANCEL_BIT));
+                        if queued_cancels.insert(*id) {
+                            state
+                                .backlog
+                                .push_back(opcode::AsyncCancel::new(*id).build().user_data(*id | CANCEL_BIT));
+                        }
                     }
                 }
                 #[cfg(feature = "fault-injection")]
@@ -1419,9 +1431,11 @@ fn drive(
                     );
                     shutting_down = true;
                     for id in state.pending.keys() {
-                        state
-                            .backlog
-                            .push_back(opcode::AsyncCancel::new(*id).build().user_data(*id | CANCEL_BIT));
+                        if queued_cancels.insert(*id) {
+                            state
+                                .backlog
+                                .push_back(opcode::AsyncCancel::new(*id).build().user_data(*id | CANCEL_BIT));
+                        }
                     }
                 }
             }
@@ -1552,6 +1566,10 @@ fn drive(
                         Err(_) => stats.orphan_reclaimed.fetch_add(1, Ordering::SeqCst),
                     };
                     stats.in_flight.fetch_sub(1, Ordering::SeqCst);
+                    // Drop any queued-cancel bookkeeping for this now-gone op so
+                    // the dedup set stays bounded by the pending table
+                    // (rustfs/backlog#1167).
+                    queued_cancels.remove(&ud);
                     // `p` (and with it `_permit`) is dropped here, at the CQE
                     // and pending-table removal — never at future drop (C10,
                     // rustfs/backlog#1060). No manual release to forget.
@@ -1583,15 +1601,16 @@ fn drive(
             let _ = state.ring.submit();
         }
 
-        // Monitor CQ overflow. With NODROP (asserted at probe) the crate's
-        // submit() auto-flushes the kernel overflow list, so this should stay
-        // 0; any non-zero value means CQEs were lost — pending entries would
-        // never be reclaimed. Record it as a fatal signal (C5,
-        // rustfs/backlog#1056).
+        // Monitor CQ overflow. With NODROP (asserted at probe) overflowed CQEs
+        // are BUFFERED in the kernel overflow list and flushed on the next enter,
+        // never lost — so a non-zero value is a backpressure warning, not fatal
+        // loss (rustfs/backlog#1056, #1167). In-flight reads are capped at
+        // `entries` and cancels are deduped (at most one per op), keeping total
+        // completions <= 2*entries, so this should stay 0 in practice.
         let overflow = state.ring.completion().overflow();
         if overflow != 0 {
             stats.cq_overflow.store(overflow as u64, Ordering::SeqCst);
-            eprintln!("uring-spike driver: CQ overflow = {overflow}; CQEs lost — treat as fatal in P2");
+            eprintln!("uring-spike driver: CQ overflow = {overflow}; CQEs buffered (NODROP), not lost — backpressure warning");
         }
 
         // 4. Exit when drained: the kernel no longer references any buffer, so
@@ -1633,6 +1652,13 @@ fn drive(
                 // entries keep their permits, which is fine: nothing waits on
                 // them any more.
                 sem.close();
+                // The leaked ring still has `cq_efd` registered via
+                // IORING_REGISTER_EVENTFD and in-flight ops that may post CQEs, so
+                // the eventfd must outlive it. Leak it alongside the ring instead
+                // of letting the returning `drive` drop (close) it out from under
+                // the still-mapped ring, honoring start_shard's documented "cq_efd
+                // outlives the ring" invariant on this exit too (rustfs/backlog#1167).
+                std::mem::forget(cq_efd);
                 std::mem::forget(state);
                 return;
             }
