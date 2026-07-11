@@ -550,22 +550,23 @@ impl Drop for ReadHandle {
         // until the CQE. All we may do is ask the kernel to hurry up. A handle
         // dropped before it was submitted (Inert / WaitingPermit) has no buffer,
         // no permit and no SQE, so there is nothing to cancel.
-        if let HandleState::Submitted { wake } = &self.state {
-            if !self.finished && self.cancel_on_drop {
-                // Close the receiver BEFORE waking the driver. The wake below
-                // makes the driver process the cancel immediately, possibly while
-                // this drop is still running — before the `rx` field is
-                // destroyed. Closing it first guarantees the cancel-induced
-                // completion the driver reaps is counted as an orphan reclaim, not
-                // delivered to a receiver that is about to drop anyway
-                // (rustfs/backlog#1163).
-                self.rx.close();
-                let _ = self.tx.send(Msg::Cancel { id: self.id });
-                // Wake the loop so the cancel is queued now, not after the
-                // heartbeat. On an idle ring (the hung-disk case cancel-on-drop
-                // exists for) this keeps orphan reclamation prompt.
-                wake.signal();
-            }
+        if let HandleState::Submitted { wake } = &self.state
+            && !self.finished
+            && self.cancel_on_drop
+        {
+            // Close the receiver BEFORE waking the driver. The wake below
+            // makes the driver process the cancel immediately, possibly while
+            // this drop is still running — before the `rx` field is
+            // destroyed. Closing it first guarantees the cancel-induced
+            // completion the driver reaps is counted as an orphan reclaim, not
+            // delivered to a receiver that is about to drop anyway
+            // (rustfs/backlog#1163).
+            self.rx.close();
+            let _ = self.tx.send(Msg::Cancel { id: self.id });
+            // Wake the loop so the cancel is queued now, not after the
+            // heartbeat. On an idle ring (the hung-disk case cancel-on-drop
+            // exists for) this keeps orphan reclamation prompt.
+            wake.signal();
         }
     }
 }
@@ -1444,7 +1445,7 @@ fn drive(
                             continue;
                         }
                     };
-                    let mut buf = vec![0u8; cap];
+                    let buf = vec![0u8; cap];
                     let pad = buf.as_ptr().align_offset(align);
                     // Runtime guard (not a debug-only assert): if the allocator
                     // ever returned a block `align_offset` cannot satisfy, refuse
