@@ -23,13 +23,21 @@ aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- Route the driver's runtime diagnostics (submit-error, CQ-overflow,
+  bounded-drain, shutdown-timeout) through `tracing` with structured fields
+  instead of `eprintln!`, unifying with the RustFS tracing pipeline for
+  filterable observability. The panic-abort barrier keeps its direct `stderr`
+  write, since a subscriber may not flush before `abort()`.
+
 ### Docs
 
 - Rewrote the README from the current public API — all three read entry points
   (`read_at`, `read_at_direct`, `read_current`) and the degradation contract —
-  and removed the `docs/DESIGN.md` design notes. The per-invariant rationale now
-  lives in the module and function docs and in the README, so there is a single
-  source of truth.
+  and trimmed it to a lean front page: the per-invariant rationale lives inline
+  in the module and function docs, not duplicated in prose. Removed the
+  `docs/DESIGN.md` design notes for a single source of truth.
 
 ## [0.2.0] - 2026-07-11
 

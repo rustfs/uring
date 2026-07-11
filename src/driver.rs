@@ -1003,9 +1003,9 @@ impl UringDriver {
         // but safe outcome, not a panic. Callers/tests that require a clean drain
         // assert on the returned snapshot themselves.
         if snap.in_flight != 0 {
-            eprintln!(
-                "uring-spike shutdown: {} ops still in flight (bounded-drain bailout on a hung device)",
-                snap.in_flight
+            tracing::warn!(
+                in_flight = snap.in_flight,
+                "uring shutdown: ops still in flight (bounded-drain bailout on a hung device)"
             );
         }
         snap
@@ -1316,12 +1316,12 @@ fn submit_ring(
             *consecutive_submit_errors += 1;
             if !*submit_error_logged {
                 *submit_error_logged = true;
-                eprintln!("uring-spike driver: ring.submit() failed ({e}); retrying, will shut down if persistent");
+                tracing::warn!(error = %e, "uring driver: ring.submit() failed; retrying, will shut down if persistent");
             }
             if !*shutting_down && *consecutive_submit_errors >= MAX_CONSECUTIVE_SUBMIT_ERRORS {
-                eprintln!(
-                    "uring-spike driver: {} consecutive submit failures; shutting down so callers fall back to the std backend",
-                    *consecutive_submit_errors
+                tracing::warn!(
+                    consecutive_errors = *consecutive_submit_errors,
+                    "uring driver: consecutive submit failures; shutting down so callers fall back to the std backend"
                 );
                 *shutting_down = true;
                 let ids: Vec<u64> = state.pending.keys().copied().collect();
@@ -1682,7 +1682,10 @@ fn drive(
         let overflow = state.ring.completion().overflow();
         if overflow != 0 {
             stats.cq_overflow.store(overflow as u64, Ordering::SeqCst);
-            eprintln!("uring-spike driver: CQ overflow = {overflow}; CQEs buffered (NODROP), not lost — backpressure warning");
+            tracing::warn!(
+                overflow,
+                "uring driver: CQ overflow; CQEs buffered (NODROP), not lost — backpressure warning"
+            );
         }
 
         // 4. Exit when drained: the kernel no longer references any buffer, so
@@ -1702,10 +1705,9 @@ fn drive(
                 // in-execution regular-file read on a hung disk). We must NOT
                 // unmap the ring or free the still-in-flight buffers — leak the
                 // whole state (leak over UAF) and exit so shutdown() returns.
-                eprintln!(
-                    "uring-spike driver: bounded drain timed out with {} ops still in flight; \
-                     leaking ring + buffers to stay memory-safe",
-                    state.pending.len()
+                tracing::warn!(
+                    in_flight = state.pending.len(),
+                    "uring driver: bounded drain timed out with ops still in flight; leaking ring + buffers to stay memory-safe"
                 );
                 // Fail every stranded caller BEFORE leaking the pending table.
                 // `oneshot::Sender::send` consumes the sender and never touches
