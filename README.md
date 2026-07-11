@@ -13,7 +13,7 @@ When a caller drops the future of an in-flight read (an erasure-code quorum was 
 
 ```toml
 [target.'cfg(target_os = "linux")'.dependencies]
-rustfs-uring = "0.2.0"
+rustfs-uring = "0.2.1"
 ```
 
 ## Usage
