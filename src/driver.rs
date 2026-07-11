@@ -82,6 +82,13 @@ fn aligned_geometry(offset: u64, len: usize, align: usize) -> Option<(u64, usize
 /// deadline is still checked and any queued cancel is picked up promptly.
 const LOOP_HEARTBEAT: Duration = Duration::from_millis(50);
 
+/// Consecutive non-transient `ring.submit()` failures the driver tolerates
+/// before it stops retrying silently and shuts the shard down, so callers get a
+/// driver-gone error and fall back to the std backend instead of stalling
+/// forever on ops the kernel will never accept (rustfs/backlog#1162). With the
+/// 50 ms heartbeat this bounds the silent-retry window to a few seconds.
+const MAX_CONSECUTIVE_SUBMIT_ERRORS: u32 = 128;
+
 /// Owned `eventfd(2)` used to wake the driver loop (backlog#1102): one is
 /// registered with the ring so the kernel signals it on every CQE, the other is
 /// signaled by `submit`/shutdown so a new message wakes the loop immediately —
@@ -237,6 +244,7 @@ struct DriverStats {
     cancel_not_found: AtomicU64,
     cancel_already: AtomicU64,
     cq_overflow: AtomicU64,
+    submit_errors: AtomicU64,
 }
 
 /// Point-in-time copy of the driver counters.
@@ -266,6 +274,12 @@ pub struct StatsSnapshot {
     /// CQEs were lost, so their pending entries are never reclaimed and drain
     /// never completes. Treated as fatal (C5, rustfs/backlog#1056).
     pub cq_overflow: u64,
+    /// `ring.submit()` calls that returned a non-transient error. A rising count
+    /// means `io_uring_enter` is persistently failing (e.g. a seccomp/LSM policy
+    /// applied after startup); the driver shuts the shard down after a bounded
+    /// run of consecutive failures so callers fall back instead of stalling
+    /// (rustfs/backlog#1162).
+    pub submit_errors: u64,
 }
 
 enum Msg {
@@ -826,6 +840,7 @@ impl UringDriver {
             snap.cancel_not_found += s.cancel_not_found.load(Ordering::SeqCst);
             snap.cancel_already += s.cancel_already.load(Ordering::SeqCst);
             snap.cq_overflow += s.cq_overflow.load(Ordering::SeqCst);
+            snap.submit_errors += s.submit_errors.load(Ordering::SeqCst);
         }
         snap
     }
@@ -1101,6 +1116,10 @@ fn drive(
     };
     let mut shutting_down = false;
     let mut drain_deadline: Option<Instant> = None;
+    // Consecutive non-transient submit failures, and a once-only log latch, for
+    // the persistent-submit-failure escape hatch (rustfs/backlog#1162).
+    let mut consecutive_submit_errors: u32 = 0;
+    let mut submit_error_logged = false;
 
     // Bounded-drain deadline (C4, rustfs/backlog#1055). Production always uses the
     // fixed DRAIN_TIMEOUT; a fault-injection build may shorten it via env so the
@@ -1264,15 +1283,47 @@ fn drive(
             }
         }
         match state.ring.submit() {
-            Ok(_) => {}
+            Ok(_) => consecutive_submit_errors = 0,
             Err(e) if e.raw_os_error() == Some(libc::EBUSY) => {
                 // CQ-overflow backpressure on pre-5.19 NODROP kernels: the
                 // kernel refuses new submissions until we reap. Keep the
                 // backlog and reap this turn instead of spinning (C5,
-                // rustfs/backlog#1056).
+                // rustfs/backlog#1056). Transient — not a submit failure.
+                consecutive_submit_errors = 0;
             }
-            Err(_) => {
-                // EINTR and friends: retry on the next loop turn.
+            Err(e) if e.raw_os_error() == Some(libc::EINTR) => {
+                // A signal interrupted the enter and the SQEs were not consumed;
+                // retry on the next loop turn (transient).
+                consecutive_submit_errors = 0;
+            }
+            Err(e) => {
+                // Any other errno: the queued SQEs were not accepted, so their
+                // CQEs never arrive and their callers would hang. A brief run may
+                // be transient (EAGAIN under memory pressure); a persistent one
+                // (e.g. EPERM from a seccomp/LSM policy applied after startup)
+                // must NOT be retried forever in silence. Count it, log once, and
+                // after a bounded run of consecutive failures shut the shard down
+                // so the drain + bounded-drain bailout fail every pending caller
+                // with an error — they fall back to the std backend
+                // (rustfs/backlog#1162).
+                stats.submit_errors.fetch_add(1, Ordering::SeqCst);
+                consecutive_submit_errors += 1;
+                if !submit_error_logged {
+                    submit_error_logged = true;
+                    eprintln!("uring-spike driver: ring.submit() failed ({e}); retrying, will shut down if persistent");
+                }
+                if !shutting_down && consecutive_submit_errors >= MAX_CONSECUTIVE_SUBMIT_ERRORS {
+                    eprintln!(
+                        "uring-spike driver: {consecutive_submit_errors} consecutive submit failures; \
+                         shutting down so callers fall back to the std backend"
+                    );
+                    shutting_down = true;
+                    for id in state.pending.keys() {
+                        state
+                            .backlog
+                            .push_back(opcode::AsyncCancel::new(*id).build().user_data(*id | CANCEL_BIT));
+                    }
+                }
             }
         }
 
