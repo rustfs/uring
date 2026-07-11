@@ -15,11 +15,11 @@ wired into the storage layer.
 
 > **Status:** read path only, Linux only. The read path is wired into `rustfs/rustfs` behind a runtime probe and is
 > **off by default** (`RUSTFS_IO_URING_READ_ENABLE`). See [`CHANGELOG.md`](CHANGELOG.md) for what has landed and the
-> [design notes](https://github.com/rustfs/uring/blob/v0.1.0/docs/DESIGN.md) for the invariants.
+> [design notes](https://github.com/rustfs/uring/blob/0.2.0/docs/DESIGN.md) for the invariants.
 
 ```toml
 [target.'cfg(target_os = "linux")'.dependencies]
-rustfs-uring = "0.1.0"
+rustfs-uring = "0.2.0"
 ```
 
 ## The ownership model it enforces
@@ -40,7 +40,7 @@ proves and enforces the invariants any production io_uring integration must foll
 Each invariant holds **per shard** (see below), because a shard is an independent instance of the same driver.
 
 The full invariant list, the corrected fd-reuse mechanism, and the design constraints are in
-the [design notes](https://github.com/rustfs/uring/blob/v0.1.0/docs/DESIGN.md).
+the [design notes](https://github.com/rustfs/uring/blob/0.2.0/docs/DESIGN.md).
 
 ## Usage
 

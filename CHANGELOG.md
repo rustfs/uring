@@ -23,8 +23,13 @@ aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+No unreleased changes.
+
+## [0.2.0] - 2026-07-11
+
 Hardening pass from the rustfs/backlog#1160 audit. All changes are on the read
-path and preserve the cancel-safety ownership model.
+path and preserve the cancel-safety ownership model; both `run-docker.sh` legs
+(seccomp-blocked degradation and real io_uring) pass.
 
 ### Added
 
@@ -64,6 +69,20 @@ path and preserve the cancel-safety ownership model.
 - **Idle churn cut**: the loop skips `io_uring_enter` on an empty SQ and uses a
   longer heartbeat when idle; each ring caps its io-wq bounded workers.
   (backlog#1169)
+
+### Changed
+
+- **Internal driver-loop refactor** folding the duplicated submit,
+  cancel-enqueue, and resubmit-SQE paths into single helpers (`submit_ring`,
+  `queue_cancel`, `Pending::resubmit_sqe`, `flush_backlog`). No behavior change;
+  the perf-sensitive submit → reap → conditional re-flush order is kept so a
+  cache-hit read is still reaped the same turn it completes inline.
+  (backlog#1160)
+
+### Tests
+
+- Deterministic sharded cancel-routing test proving a drop-cancel reaches the
+  ring that accepted the op. (backlog#1180)
 
 ## [0.1.0] - 2026-07-11
 
@@ -189,5 +208,6 @@ built. They are listed so nobody re-opens them without new evidence.
 [rustfs/backlog#1051]: https://github.com/rustfs/backlog/issues/1051
 [rustfs/backlog#1144]: https://github.com/rustfs/backlog/issues/1144
 [rustfs/backlog#1159]: https://github.com/rustfs/backlog/issues/1159
-[Unreleased]: https://github.com/rustfs/uring/compare/0.1.0...HEAD
+[Unreleased]: https://github.com/rustfs/uring/compare/0.2.0...HEAD
+[0.2.0]: https://github.com/rustfs/uring/compare/0.1.0...0.2.0
 [0.1.0]: https://github.com/rustfs/uring/releases/tag/0.1.0

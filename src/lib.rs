@@ -33,8 +33,8 @@
 //! reads, `O_DIRECT` reads with internal alignment, sharded rings, async
 //! backpressure, eventfd-driven reaping, graceful restricted-environment
 //! detection, and bounded shutdown drain. The write path is intentionally out
-//! of scope for `0.1.0`; see the
-//! [design notes](https://github.com/rustfs/uring/blob/v0.1.0/docs/DESIGN.md)
+//! of scope; see the
+//! [design notes](https://github.com/rustfs/uring/blob/0.2.0/docs/DESIGN.md)
 //! for the invariant details.
 
 #[cfg(target_os = "linux")]
