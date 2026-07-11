@@ -23,7 +23,47 @@ aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-No unreleased changes.
+Hardening pass from the rustfs/backlog#1160 audit. All changes are on the read
+path and preserve the cancel-safety ownership model.
+
+### Added
+
+- **Test-only fault-injection seams** for the cancel-safety escape hatches
+  (driver-thread panic, stuck bounded drain, forced probe-drain failure), gated
+  behind the `fault-injection` feature and never present in a default build.
+  ([#11], backlog#1103)
+- `StatsSnapshot::submit_errors` — count of non-transient `ring.submit()`
+  failures, so a persistently failing `io_uring_enter` is observable.
+  (backlog#1162)
+
+### Fixed
+
+- **Bounded-drain bailout no longer hangs awaited handles.** It now fails every
+  stranded caller with a driver-gone error before leaking the pending table, and
+  leaks the ring-registered eventfd alongside the ring so the "cq_efd outlives
+  the ring" invariant holds on that exit too. (backlog#1161, #1167)
+- **Persistent `ring.submit()` errors are classified** instead of retried
+  forever in silence: EINTR/EBUSY stay transient; any other errno is counted and,
+  after a bounded run, shuts the shard down so callers fall back. (backlog#1162)
+- **Wakeup gaps closed:** short-read resubmits are flushed the same turn, and a
+  drop-cancel now signals the wake eventfd (after closing the receiver so the
+  reclaim is still counted as an orphan), removing up-to-50 ms stalls.
+  (backlog#1163)
+- **Driver-thread spawn failure degrades** to a `ProbeFailure` instead of
+  panicking out of disk init. (backlog#1164)
+- **The startup probe is time-bounded** (EXT_ARG timeout with a pre-5.11
+  fallback) and runs on the first shard only. (backlog#1165)
+- **EINTR/EAGAIN completions are retried** (bounded) rather than surfaced as the
+  read's final error, and the submit offset guard also rejects an aligned end
+  crossing `i64::MAX`. (backlog#1166)
+- **CQ overflow is reported as a NODROP backpressure warning**, not fatal loss,
+  and AsyncCancel SQEs are deduplicated per op. (backlog#1167)
+- **O_DIRECT tail short reads are disambiguated with `fstat`** instead of assuming
+  any non-block-multiple read is EOF, so a stacked filesystem cannot cause a
+  silent truncation. (backlog#1168)
+- **Idle churn cut**: the loop skips `io_uring_enter` on an empty SQ and uses a
+  longer heartbeat when idle; each ring caps its io-wq bounded workers.
+  (backlog#1169)
 
 ## [0.1.0] - 2026-07-11
 
@@ -116,7 +156,7 @@ polished (`39018c0`).
 The cancel-safety invariants that survived that audit — the driver's pending table owning the
 buffer and fd from SQE submission until the CQE, drop-abandons-result-only, bounded shutdown
 drain, abort-before-free on a driver panic — are the ones every change above is measured
-against. See the [design notes](https://github.com/rustfs/uring/blob/v0.1.0/docs/DESIGN.md).
+against. See the [design notes](https://github.com/rustfs/uring/blob/0.1.0/docs/DESIGN.md).
 
 ## Decisions recorded, not implemented
 
@@ -145,8 +185,9 @@ built. They are listed so nobody re-opens them without new evidence.
 [#4]: https://github.com/rustfs/uring/pull/4
 [#5]: https://github.com/rustfs/uring/pull/5
 [#6]: https://github.com/rustfs/uring/pull/6
+[#11]: https://github.com/rustfs/uring/pull/11
 [rustfs/backlog#1051]: https://github.com/rustfs/backlog/issues/1051
 [rustfs/backlog#1144]: https://github.com/rustfs/backlog/issues/1144
 [rustfs/backlog#1159]: https://github.com/rustfs/backlog/issues/1159
-[Unreleased]: https://github.com/rustfs/uring/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/rustfs/uring/releases/tag/v0.1.0
+[Unreleased]: https://github.com/rustfs/uring/compare/0.1.0...HEAD
+[0.1.0]: https://github.com/rustfs/uring/releases/tag/0.1.0
