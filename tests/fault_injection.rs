@@ -295,3 +295,43 @@ fn probe_drain_failure_leaks_and_degrades() {
         }
     }
 }
+
+/// #1164: driver-thread spawn failure (EAGAIN under a cgroup pids-limit /
+/// RLIMIT_NPROC) must degrade to a `ProbeFailure` so the caller selects the std
+/// backend — never panic out of async disk init. The seam forces the spawn step
+/// to fail; the probe must return an error, not unwind, and leave global state
+/// intact for a later normal probe.
+#[test]
+fn spawn_failure_degrades_instead_of_panicking() {
+    // SAFETY: `--test-threads=1` serializes tests; no concurrent env readers.
+    unsafe {
+        std::env::set_var("RUSTFS_URING_FAULT_SPAWN", "1");
+    }
+    let result = UringDriver::probe_and_start_sharded(64, 3);
+    // SAFETY: `--test-threads=1` teardown.
+    unsafe {
+        std::env::remove_var("RUSTFS_URING_FAULT_SPAWN");
+    }
+
+    match result {
+        Ok(_) => panic!("driver started despite the forced spawn failure"),
+        Err(e) if e.is_expected_restriction() => {
+            // leg 1: io_uring was blocked before the probe reached the spawn seam.
+            eprintln!("SKIP spawn_failure_degrades_instead_of_panicking: restricted environment ({e:?})");
+        }
+        Err(e) => {
+            // leg 2: the forced EAGAIN propagated as a ProbeFailure (degrade, not
+            // panic). EAGAIN is not a restriction errno, so the caller logs an
+            // unexpected-probe warning and still falls back to the std backend.
+            assert!(
+                !e.is_expected_restriction(),
+                "forced spawn EAGAIN must not look like an environment restriction: {e:?}"
+            );
+            // A subsequent NORMAL probe must still succeed — the aborted start
+            // cleaned up any partially-started shard without corrupting state.
+            let driver =
+                UringDriver::probe_and_start_sharded(64, 2).expect("a normal probe after a forced spawn failure must still work");
+            let _ = driver.shutdown();
+        }
+    }
+}

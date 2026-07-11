@@ -653,10 +653,24 @@ impl UringDriver {
         // (2*entries), so CQ overflow is structurally unreachable (C5/C10).
         let sem = Arc::new(Semaphore::new(entries as usize));
         let thread_sem = Arc::clone(&sem);
+        // Deterministic spawn-failure seam (rustfs/backlog#1164): exercise the
+        // degrade-not-panic path without a real cgroup pids-limit. Never present
+        // in a default build.
+        #[cfg(feature = "fault-injection")]
+        if std::env::var_os("RUSTFS_URING_FAULT_SPAWN").is_some() {
+            return Err(ProbeFailure::Setup(io::Error::from_raw_os_error(libc::EAGAIN)));
+        }
+
+        // Thread creation fails with EAGAIN under a cgroup pids-limit or
+        // RLIMIT_NPROC — exactly the constrained environments the probe/degrade
+        // design exists for. Degrade to the std backend instead of panicking out
+        // of async disk init/reconnect (rustfs/backlog#1164). The spawn happens
+        // after the probe read already drained, so on failure `ring`/`cq_efd`
+        // (moved into the closure) drop cleanly with no SQE in flight.
         let handle = std::thread::Builder::new()
             .name("uring-spike-driver".into())
             .spawn(move || drive(ring, rx, thread_stats, thread_sem, cq_efd, thread_wake))
-            .expect("spawn driver thread");
+            .map_err(ProbeFailure::Setup)?;
 
         Ok(Shard {
             tx,
