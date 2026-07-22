@@ -37,12 +37,12 @@ fault-injection = []
 [dependencies]
 # tracing for driver diagnostics: unifies with the RustFS tracing pipeline for
 # structured, filterable observability; a no-op when no subscriber is installed.
-tracing = { version = "0.1", default-features = false, features = ["std"] }
-tokio = { version = "1.52.3", default-features = false, features = ["sync"] }
+tracing = { version = "0.1.44", default-features = false, features = ["std"] }
+tokio = { version = "1.53.1", default-features = false, features = ["sync"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7.13"
-libc = "0.2.186"
+libc = "0.2.189"
 
 [dev-dependencies]
-tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time"] }
