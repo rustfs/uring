@@ -41,7 +41,7 @@ tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 tokio = { version = "1.53.1", default-features = false, features = ["sync"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-io-uring = "0.7.13"
+io-uring = "0.7.14"
 libc = "0.2.189"
 
 [dev-dependencies]
