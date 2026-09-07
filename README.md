@@ -24,9 +24,13 @@ use std::sync::Arc;
 use rustfs_uring::UringDriver;
 
 # async fn demo() -> std::io::Result<()> {
-// Probe a real IORING_OP_READ before accepting work. On a restricted host the
-// ProbeFailure's `is_expected_restriction()` says to degrade to the std backend.
-let driver = UringDriver::probe_and_start(64).expect("io_uring available");
+// Probe a real IORING_OP_READ before accepting work. On a restricted host,
+// `ProbeFailure::is_expected_restriction()` identifies the expected fallback.
+let driver = match UringDriver::probe_and_start(64) {
+    Ok(driver) => driver,
+    Err(err) if err.is_expected_restriction() => return Ok(()), // use std backend
+    Err(err) => return Err(std::io::Error::other(err)),
+};
 let file = Arc::new(File::open("/data/object")?);
 
 // Positioned read (whole-range: short reads are resubmitted). Dropping the
@@ -43,6 +47,36 @@ assert_eq!(snapshot.delivered + snapshot.orphan_reclaimed, snapshot.submitted);
 - `read_at_direct(file, offset, len, align)` — the same for an `O_DIRECT` fd; `offset`/`len` need not be aligned (the driver reads a block-aligned superset and returns exactly the requested range).
 - `read_current(file, len)` — `read(2)` semantics from the current position, for pipes and other non-seekable fds (a short read is a valid final result).
 - `probe_and_start_sharded(entries, shards)` — several independent rings per disk (each ring caps at one core's memory bandwidth for cache-hit reads); `probe_and_start(entries)` equals `..._sharded(entries, 1)`.
+
+## API contract
+
+The public API is intentionally small and read-only:
+
+- `UringDriver::probe_and_start` performs both ring setup and a real read
+  round-trip. Treat `ProbeFailure` as a startup decision: expected restriction
+  errors (`EACCES`, `EPERM`, `ENOSYS`, `EINVAL`, `EOPNOTSUPP`) select the std
+  backend; other errors should be logged and investigated.
+- `read_at` uses positioned (`pread`) semantics and resubmits short reads until
+  the requested range is complete or EOF. `read_current` follows `read(2)`:
+  one short read is a successful result and is not resubmitted.
+- `read_at_direct` requires an `O_DIRECT` descriptor and a power-of-two block
+  size. The `offset` and `len` arguments may be unaligned; the returned vector
+  always has exactly the logical range (never alignment padding).
+- Invalid offsets, lengths, and alignments are reported through the awaited
+  `io::Result`; they do not panic. In particular, `u64::MAX` is reserved for
+  `read_current` and is rejected by positioned APIs.
+- A `ReadHandle` may be dropped at any time. Dropping an in-flight handle
+  abandons only its result; the driver retains the buffer and file descriptor
+  until the completion event. Call `without_cancel_on_drop` when best-effort
+  cancellation is not desired.
+- Call `shutdown` when the driver is no longer needed. It cancels and drains
+  all shards before unmapping rings. A hung device may trigger the bounded
+  leak-over-UAF escape hatch; inspect `StatsSnapshot::in_flight` to distinguish
+  that degraded outcome from a clean drain.
+
+`StatsSnapshot` is a point-in-time diagnostic view. The conservation identity
+`submitted == delivered + orphan_reclaimed` holds after all completions have
+been reaped; `in_flight == 0` indicates a clean shutdown.
 
 ## Testing
 

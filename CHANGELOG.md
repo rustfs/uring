@@ -23,6 +23,21 @@ aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Exported `ReadHandle` from the crate root so callers can name the public
+  return type and access its rustdoc contract.
+- Added standard `Display` and `Error` implementations for `ProbeFailure`.
+- Added a complete API contract section covering probing/fallback, read modes,
+  alignment, cancellation, backpressure, and shutdown diagnostics.
+
+### Fixed
+
+- Positioned reads now return `io::ErrorKind::InvalidInput` when passed the
+  reserved `u64::MAX` offset instead of panicking and accidentally exposing the
+  stream-read sentinel.
+- Enabled `missing_docs` and broken-link rustdoc lints for the public API.
+
 ## [0.2.1] - 2026-07-11
 
 ### Changed
