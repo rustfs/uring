@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![deny(missing_docs)]
+#![deny(rustdoc::broken_intra_doc_links)]
+
 //! Cancel-safe async io_uring read backend for RustFS
 //! (rustfs/backlog#894, hardened per the #1048/#1051 audit).
 //!
@@ -35,9 +38,15 @@
 //! restricted-environment detection, and bounded shutdown drain. The write path
 //! is intentionally out of scope. See the crate README and the per-item docs
 //! below for the invariant details.
+//!
+//! On Linux, call `UringDriver::probe_and_start` (or the sharded variant)
+//! before issuing reads. A probe failure is returned to the caller so a storage
+//! layer can select its blocking/std backend. Once started, reads are submitted
+//! eagerly while capacity is available; when all permits are occupied, the
+//! returned `ReadHandle` waits asynchronously for capacity on its first poll.
 
 #[cfg(target_os = "linux")]
 mod driver;
 
 #[cfg(target_os = "linux")]
-pub use driver::{ProbeFailure, StatsSnapshot, UringDriver};
+pub use driver::{ProbeFailure, ReadHandle, StatsSnapshot, UringDriver};

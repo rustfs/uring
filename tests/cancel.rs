@@ -407,6 +407,8 @@ async fn no_cq_overflow_under_load() {
 /// Boundary reads on a regular file (C16, rustfs/backlog#1065): len==0, read at
 /// EOF, a cross-EOF short read delivered to a live receiver (exercises the C9
 /// resubmit loop), and the rejected huge-len / huge-offset guards (C6/C7).
+/// Positioned APIs must also reject the internal `u64::MAX` sentinel without
+/// panicking.
 #[tokio::test(flavor = "multi_thread")]
 async fn boundary_reads() {
     let Some(driver) = driver_or_skip("boundary_reads") else {
@@ -443,6 +445,16 @@ async fn boundary_reads() {
         .await
         .expect_err("huge offset must be rejected");
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "huge offset error: {err:?}");
+    let err = driver
+        .read_at(Arc::clone(&file), u64::MAX, 16)
+        .await
+        .expect_err("reserved offset must be rejected");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "reserved offset error: {err:?}");
+    let err = driver
+        .read_at_direct(Arc::clone(&file), u64::MAX, 16, 1)
+        .await
+        .expect_err("reserved direct offset must be rejected");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "reserved direct offset error: {err:?}");
 
     driver.shutdown();
     let _ = std::fs::remove_file(path);

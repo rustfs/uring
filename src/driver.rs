@@ -197,6 +197,23 @@ pub enum ProbeFailure {
     ReadOp(io::Error),
 }
 
+impl std::fmt::Display for ProbeFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Setup(err) => write!(f, "io_uring setup failed: {err}"),
+            Self::ReadOp(err) => write!(f, "io_uring probe read failed: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for ProbeFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(match self {
+            Self::Setup(err) | Self::ReadOp(err) => err,
+        })
+    }
+}
+
 impl ProbeFailure {
     /// True when the **probe-time** errno belongs to the "expected
     /// restriction" class that P2 maps to permanent per-disk fallback:
@@ -453,6 +470,7 @@ enum HandleState {
 /// (the common case, unchanged from the blocking implementation). Only when the
 /// semaphore is saturated does the handle acquire the permit and submit on its
 /// first poll, so `submit` never blocks a runtime worker.
+#[must_use = "a read handle must be awaited or explicitly dropped"]
 pub struct ReadHandle {
     id: u64,
     rx: oneshot::Receiver<io::Result<Vec<u8>>>,
@@ -463,6 +481,16 @@ pub struct ReadHandle {
 }
 
 impl ReadHandle {
+    /// Keep the driver's buffer until the normal CQE even when this handle is
+    /// dropped.
+    ///
+    /// By default, dropping an in-flight handle sends a best-effort
+    /// `IORING_OP_ASYNC_CANCEL` request to accelerate reclamation. This method
+    /// disables that request while preserving the same memory-safety guarantee:
+    /// the driver still owns the buffer and file descriptor until the read's
+    /// completion arrives. It is useful when cancellation traffic would add
+    /// more work than the abandoned read itself.
+    #[must_use = "the returned handle carries the changed cancellation policy"]
     pub fn without_cancel_on_drop(mut self) -> Self {
         self.cancel_on_drop = false;
         self
@@ -611,6 +639,13 @@ impl Drop for Shard {
     }
 }
 
+/// Process-level io_uring read driver.
+///
+/// A driver owns one or more independent Linux io_uring shards. It is safe to
+/// share by reference across async tasks; each read returns a [`ReadHandle`]
+/// that can be awaited or dropped without freeing memory still visible to the
+/// kernel. Construct it through [`UringDriver::probe_and_start`] so restricted
+/// environments can fall back to a blocking backend before serving traffic.
 pub struct UringDriver {
     /// One or more independent rings. A cache-hit buffered read completes inline
     /// inside `io_uring_enter`, so the thread driving a ring performs that
@@ -752,14 +787,17 @@ impl UringDriver {
     }
 
     /// Positioned read (pread semantics) — regular files, buffered.
+    ///
+    /// The offset must be at most `i64::MAX`; `u64::MAX` is reserved for
+    /// [`Self::read_current`] and is returned as an asynchronous
+    /// `io::ErrorKind::InvalidInput` result rather than panicking.
     pub fn read_at(&self, file: Arc<File>, offset: u64, len: usize) -> ReadHandle {
-        assert_ne!(offset, CURRENT_POSITION, "offset u64::MAX is reserved");
-        self.submit(file, offset, len, 1)
+        self.submit(file, offset, len, 1, false)
     }
 
     /// Read at the file's current position (read(2) semantics) — pipes.
     pub fn read_current(&self, file: Arc<File>, len: usize) -> ReadHandle {
-        self.submit(file, CURRENT_POSITION, len, 1)
+        self.submit(file, CURRENT_POSITION, len, 1, true)
     }
 
     /// Positioned read from a file opened with `O_DIRECT` (rustfs/backlog#1102).
@@ -773,12 +811,13 @@ impl UringDriver {
     ///
     /// The caller must have opened `file` with `O_DIRECT`; otherwise this is
     /// just a (correct but pointless) buffered read of the superset range.
+    /// Invalid alignment, range, or reserved-offset inputs are returned through
+    /// the awaited result as `io::ErrorKind::InvalidInput`.
     pub fn read_at_direct(&self, file: Arc<File>, offset: u64, len: usize, align: usize) -> ReadHandle {
-        assert_ne!(offset, CURRENT_POSITION, "offset u64::MAX is reserved");
-        self.submit(file, offset, len, align)
+        self.submit(file, offset, len, align, false)
     }
 
-    fn submit(&self, file: Arc<File>, offset: u64, len: usize, align: usize) -> ReadHandle {
+    fn submit(&self, file: Arc<File>, offset: u64, len: usize, align: usize, allow_current_position: bool) -> ReadHandle {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         assert_eq!(id & CANCEL_BIT, 0, "op id overflowed into the cancel bit");
         let (done, rx) = oneshot::channel();
@@ -789,6 +828,25 @@ impl UringDriver {
         // to a ring whose pending table does not hold the op. The rejection paths
         // below return an `Inert` handle that never sends, but still need a `tx`.
         let shard = self.shard();
+
+        // `CURRENT_POSITION` is an internal sentinel used only by
+        // `read_current`; accepting it through a positioned API would silently
+        // change pread semantics into read(2) semantics. Return a normal
+        // `InvalidInput` result instead of panicking on caller-controlled data.
+        if !allow_current_position && offset == CURRENT_POSITION {
+            let _ = done.send(Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "offset u64::MAX is reserved for read_current",
+            )));
+            return ReadHandle {
+                id,
+                rx,
+                tx: shard.tx.clone(),
+                finished: false,
+                cancel_on_drop: false,
+                state: HandleState::Inert,
+            };
+        }
 
         // Reject an offset the kernel would answer with a runtime EINVAL that
         // must NOT be mistaken for an environment restriction (C7,
@@ -848,7 +906,7 @@ impl UringDriver {
             // it). Exempt them exactly as the offset guard above does.
             Some((kernel_offset, _, region_len))
                 if region_len <= MAX_READ_LEN
-                    && (offset == CURRENT_POSITION
+                    && (allow_current_position && offset == CURRENT_POSITION
                         || kernel_offset
                             .checked_add(region_len as u64)
                             .is_some_and(|end| end <= i64::MAX as u64)) => {}
