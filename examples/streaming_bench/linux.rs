@@ -243,7 +243,7 @@ fn create_file(path: &str, size: usize) -> io::Result<()> {
         // `written` is always a multiple of 8 here (the buffer is), so word
         // indices line up with absolute offsets.
         let base = (written / 8) as u64;
-        for (w, word) in buf.chunks_exact_mut(8).enumerate() {
+        for (w, word) in buf.as_chunks_mut::<8>().0.iter_mut().enumerate() {
             word.copy_from_slice(&expected_word(base + w as u64));
         }
         let n = (size - written).min(buf.len());
