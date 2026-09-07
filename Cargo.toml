@@ -14,9 +14,9 @@
 
 [package]
 name = "rustfs-uring"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
-rust-version = "1.96"
+rust-version = "1.98"
 license = "Apache-2.0"
 description = "Cancel-safe async io_uring read backend for RustFS storage."
 repository = "https://github.com/rustfs/uring"

@@ -23,6 +23,11 @@ aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-09-07
+
+This patch release documents and hardens the public read API while preserving
+the cancel-safe ownership model and Linux-only scope.
+
 ### Added
 
 - Exported `ReadHandle` from the crate root so callers can name the public
@@ -37,6 +42,10 @@ aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   reserved `u64::MAX` offset instead of panicking and accidentally exposing the
   stream-read sentinel.
 - Enabled `missing_docs` and broken-link rustdoc lints for the public API.
+
+### Compatibility
+
+- The declared minimum supported Rust version is now 1.98.
 
 ## [0.2.1] - 2026-07-11
 
@@ -240,7 +249,8 @@ built. They are listed so nobody re-opens them without new evidence.
 [rustfs/backlog#1051]: https://github.com/rustfs/backlog/issues/1051
 [rustfs/backlog#1144]: https://github.com/rustfs/backlog/issues/1144
 [rustfs/backlog#1159]: https://github.com/rustfs/backlog/issues/1159
-[Unreleased]: https://github.com/rustfs/uring/compare/0.2.1...HEAD
+[Unreleased]: https://github.com/rustfs/uring/compare/0.2.2...HEAD
+[0.2.2]: https://github.com/rustfs/uring/compare/0.2.1...0.2.2
 [0.2.1]: https://github.com/rustfs/uring/compare/0.2.0...0.2.1
 [0.2.0]: https://github.com/rustfs/uring/compare/0.1.0...0.2.0
 [0.1.0]: https://github.com/rustfs/uring/releases/tag/0.1.0
