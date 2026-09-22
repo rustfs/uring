@@ -11,7 +11,7 @@ fn byte_saturation_returns_partial_count_reservation_on_drop() {
     let count = Arc::new(Semaphore::new(2));
     let bytes = Arc::new(Semaphore::new(8));
     let first = try_read_permits(&count, Some(&bytes), 8).unwrap();
-    let mut waiting = acquire_read_permits(count.clone(), Some(bytes.clone()), 8);
+    let mut waiting = acquire_read_permits(count.clone(), Some(bytes.clone()), 8, None);
     assert!(poll_once(&mut waiting).is_pending());
     assert_eq!(count.available_permits(), 0);
     drop(waiting);
@@ -26,7 +26,7 @@ fn dropping_count_waiter_does_not_reserve_bytes() {
     let count = Arc::new(Semaphore::new(1));
     let bytes = Arc::new(Semaphore::new(8));
     let first = try_read_permits(&count, Some(&bytes), 4).unwrap();
-    let mut waiting = acquire_read_permits(count.clone(), Some(bytes.clone()), 4);
+    let mut waiting = acquire_read_permits(count.clone(), Some(bytes.clone()), 4, None);
     assert!(poll_once(&mut waiting).is_pending());
     drop(waiting);
     assert_eq!(bytes.available_permits(), 4);
@@ -41,7 +41,7 @@ fn shard_exit_closes_bytes_and_releases_waiting_count_permit() {
     admission.register(&count);
     let bytes = admission.bytes.clone();
     let first = try_read_permits(&count, Some(&bytes), 8).unwrap();
-    let mut waiting = acquire_read_permits(count.clone(), Some(bytes.clone()), 8);
+    let mut waiting = acquire_read_permits(count.clone(), Some(bytes.clone()), 8, None);
     assert!(poll_once(&mut waiting).is_pending());
     drop(CloseByteAdmission(Some(admission)));
     assert!(matches!(poll_once(&mut waiting), Poll::Ready(Err(_))));
@@ -71,7 +71,7 @@ fn global_close_wakes_count_stage_waiter_without_releasing_hung_read() {
     let admission = Arc::new(ByteAdmission::new(8));
     admission.register(&count);
     let hung = try_read_permits(&count, Some(&admission.bytes), 8).unwrap();
-    let mut waiting = acquire_read_permits(count.clone(), Some(admission.bytes.clone()), 8);
+    let mut waiting = acquire_read_permits(count.clone(), Some(admission.bytes.clone()), 8, None);
     let wake = Arc::new(LockCheckingWake {
         admission: admission.clone(),
         wakes: AtomicUsize::new(0),
@@ -87,7 +87,7 @@ fn global_close_wakes_count_stage_waiter_without_releasing_hung_read() {
         try_read_permits(&count, Some(&admission.bytes), 8),
         Err(TryAcquireError::Closed)
     ));
-    let mut new_waiter = acquire_read_permits(count.clone(), Some(admission.bytes.clone()), 8);
+    let mut new_waiter = acquire_read_permits(count.clone(), Some(admission.bytes.clone()), 8, None);
     assert!(matches!(poll_once(&mut new_waiter), Poll::Ready(Err(_))));
     assert_eq!(admission.bytes.available_permits(), 0, "hung read must remain charged");
     drop(hung);
@@ -127,10 +127,10 @@ fn canceling_partial_fifo_byte_reservation_unblocks_next_waiter() {
     let count = Arc::new(Semaphore::new(4));
     let bytes = Arc::new(Semaphore::new(8));
     let held = try_read_permits(&count, Some(&bytes), 4).unwrap();
-    let mut large = acquire_read_permits(count.clone(), Some(bytes.clone()), 6);
+    let mut large = acquire_read_permits(count.clone(), Some(bytes.clone()), 6, None);
     assert!(poll_once(&mut large).is_pending());
     assert_eq!(bytes.available_permits(), 0, "large FIFO waiter should reserve the available four bytes");
-    let mut small = acquire_read_permits(count.clone(), Some(bytes.clone()), 2);
+    let mut small = acquire_read_permits(count.clone(), Some(bytes.clone()), 2, None);
     assert!(poll_once(&mut small).is_pending());
     drop(large);
     let Poll::Ready(Ok(small)) = poll_once(&mut small) else {
@@ -163,7 +163,7 @@ fn shared_byte_budget_serializes_reads_from_distinct_shards() {
     let first = try_read_permits(&counts[0], Some(&bytes), 8).unwrap();
     assert!(matches!(try_read_permits(&counts[1], Some(&bytes), 1), Err(TryAcquireError::NoPermits)));
     assert_eq!(counts[1].available_permits(), 1);
-    let mut waiting = acquire_read_permits(counts[1].clone(), Some(bytes.clone()), 8);
+    let mut waiting = acquire_read_permits(counts[1].clone(), Some(bytes.clone()), 8, None);
     assert!(poll_once(&mut waiting).is_pending());
     drop(first);
     let Poll::Ready(Ok(second)) = poll_once(&mut waiting) else { panic!("budget was not released") };
