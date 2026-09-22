@@ -13,7 +13,7 @@ integration are separate gates; a checked code item does not close the roadmap.
 | 3.1–3.3: bounded turns, explicit batch notifications, cancellation efficiency | Implemented and independently reviewed; native regression suite passed | CPU/syscall and tail-latency comparison; PR merge |
 | 4.1: capacity-aware routing | Implemented and independently reviewed, opt-in; native tests passed | Controlled slow-shard/mixed-load performance; PR merge |
 | 4.2: system-wide budgets and probe offload | Application probe offload, driver-thread budget and logical chunk limit implemented/reviewed in draft PRs #8072/#8074/#8076 | Full CI/merge; physical byte/result/io-wq budgets and [dependency wiring](rustfs-integration.md) remain open |
-| 4.2 pool prerequisite | Library whole-driver shared quota implemented; two independent reviews and local compilation checks pass | Native CI, application dependency/fallback/result ownership wiring and merge |
+| 4.2 pool prerequisite | Library whole-driver shared quota implemented/reviewed; native CI #57 passed at `b09b966` | Application dependency/fallback/result ownership wiring and merge |
 | 5: owned buffers and direct FD cache | Dual-mode exact invalidation implemented/reviewed in application draft PR #8075; direct caching and owned buffers not enabled | Full CI/merge, profile evidence, lease/pool lifetime and complete invalidation integration |
 | 6: ordered streaming prefetch | [Example-only contract experiment](ordered-prefetch.md) implemented/reviewed; 11 portable tests and native CLI CI #54 passed | Production consumer contract, bitrot/S3 and performance evidence |
 | 7: advanced ring/runtime modes | Not enabled or implemented | Earlier gates, capability/fallback and isolated benefit evidence |
@@ -46,8 +46,14 @@ Two independent code/test/document reviews found no blocking issue. Local
 Linux-target default/all-feature all-target checks, all-feature Clippy,
 default/all-feature warning-denying rustdoc, formatting and diff checks pass;
 the default library/dependency graph remains Tokio sync-only. The initial RED
-was missing-API compilation, not a behavioral run. Native execution for this
-addition is pending. Its [contract](shared-read-budget.md) documents the
+was missing-API compilation, not a behavioral run. Subsequently, [CI #57](https://github.com/rustfs/uring/actions/runs/35796196402)
+at `b09b966` passed all three jobs: 143 native all-feature tests plus one compiled
+`no_run` documentation example, mandatory O_DIRECT, ordered-prefetch and both
+benchmark CLI smokes, lint, and restricted/unrestricted Docker legs. All seven
+private and nine public shared-budget tests ran successfully, including the
+isolated whole-quota leak and greater-than-`u32` reservation cases. Later
+evidence-only documentation commits have their own workflow status. Its
+[contract](shared-read-budget.md) documents the
 later-shard startup-failure coverage boundary and conservative idle/retirement
 reservation costs. Application wiring and performance remain separate gates.
 
