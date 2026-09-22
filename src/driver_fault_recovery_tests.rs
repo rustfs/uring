@@ -49,6 +49,7 @@ fn direct_prefix() -> (Pending, oneshot::Receiver<io::Result<Vec<u8>>>) {
         _permit: ReadPermits {
             _count: Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap(),
             _bytes: None,
+            _shared_reservation: None,
         },
         pad: 1,
         head: 2,

@@ -383,6 +383,122 @@ pub struct ReadLimits {
     pub max_in_flight_bytes: Option<usize>,
 }
 
+/// Shared whole-driver reservations for in-flight read-buffer budgets.
+///
+/// Clone this handle to give multiple drivers the same pool. Each driver reserves
+/// its entire configured [`ReadLimits::max_in_flight_bytes`] before probing, even
+/// while idle; local per-read admission is unchanged. Reservations are returned
+/// only after their driver, deferred admission and accepted reads release them.
+/// A leaked pending read retains the driver's whole reservation permanently.
+///
+/// This bounds the sum of participating drivers' reserved read-buffer limits,
+/// not completed results, allocator overhead, probe/ring allocations or RSS.
+/// Shutting down one driver never closes the pool or another driver's admission.
+/// Creating a separate pool creates a separate accounting domain.
+///
+/// # Example
+///
+/// ```no_run
+/// use std::{fs::File, sync::Arc};
+/// use rustfs_uring::{ReadLimits, SharedReadBudget, UringDriver};
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let pool = SharedReadBudget::new(24 << 20)?;
+/// let first = UringDriver::probe_and_start_with_shared_budget(
+///     64, 1,
+///     ReadLimits { max_read_len: None, max_in_flight_bytes: Some(8 << 20) },
+///     &pool,
+/// )?;
+/// let second = UringDriver::probe_and_start_with_shared_budget(
+///     64, 2,
+///     ReadLimits { max_read_len: None, max_in_flight_bytes: Some(16 << 20) },
+///     &pool,
+/// )?;
+/// assert_eq!(pool.available(), 0); // whole reservations, even while idle
+/// let file = Arc::new(File::open("object.bin")?);
+/// let reads = [first.read_at(file.clone(), 0, 4096), second.read_at(file, 4096, 4096)];
+/// drop(reads); // also release any deferred admission owners
+/// let first_stats = first.shutdown();
+/// let second_stats = second.shutdown();
+/// if first_stats.in_flight == 0 && second_stats.in_flight == 0 {
+///     assert_eq!(pool.available(), pool.capacity());
+/// }
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Clone, Debug)]
+pub struct SharedReadBudget {
+    inner: Arc<SharedReadBudgetInner>,
+}
+
+#[derive(Debug)]
+struct SharedReadBudgetInner {
+    capacity: usize,
+    available: AtomicUsize,
+}
+
+impl SharedReadBudget {
+    /// Create a pool with `total` bytes of reservation capacity.
+    ///
+    /// Zero returns `InvalidInput`. This does not allocate `total` bytes or
+    /// require a runtime. Individual driver limits must still fit Tokio's
+    /// `Semaphore::MAX_PERMITS`, but pool capacity is not narrowed to `u32`.
+    pub fn new(total: usize) -> io::Result<Self> {
+        if total == 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "shared read budget must be nonzero"));
+        }
+        Ok(Self {
+            inner: Arc::new(SharedReadBudgetInner {
+                capacity: total,
+                available: AtomicUsize::new(total),
+            }),
+        })
+    }
+
+    /// The pool's fixed whole-driver reservation capacity, in bytes.
+    pub fn capacity(&self) -> usize {
+        self.inner.capacity
+    }
+
+    /// Advisory snapshot of unreserved capacity, in bytes.
+    ///
+    /// This is not a measurement of live buffers: an idle participating driver
+    /// still holds its whole reservation. Concurrent construction or cleanup
+    /// can change this value immediately after it is read.
+    pub fn available(&self) -> usize {
+        self.inner.available.load(Ordering::Acquire)
+    }
+
+    fn reserve(&self, bytes: usize) -> io::Result<Arc<SharedReadReservation>> {
+        if bytes == 0 || bytes > self.inner.capacity {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "driver read limit must fit the shared read budget",
+            ));
+        }
+        self.inner
+            .available
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |available| available.checked_sub(bytes))
+            .map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "shared read budget has insufficient unreserved capacity"))?;
+        Ok(Arc::new(SharedReadReservation {
+            pool: Arc::clone(&self.inner),
+            bytes,
+        }))
+    }
+}
+
+struct SharedReadReservation {
+    pool: Arc<SharedReadBudgetInner>,
+    bytes: usize,
+}
+
+impl Drop for SharedReadReservation {
+    fn drop(&mut self) {
+        // One receipt refunds its successful checked subtraction exactly once.
+        // Read-path clones only touch Arc counts, never this global counter.
+        self.pool.available.fetch_add(self.bytes, Ordering::Release);
+    }
+}
+
 /// Shard selection for positioned reads. Stream reads retain round-robin routing.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ShardPolicy {
@@ -400,6 +516,7 @@ pub enum ShardPolicy {
 struct ReadPermits {
     _count: OwnedSemaphorePermit,
     _bytes: Option<OwnedSemaphorePermit>,
+    _shared_reservation: Option<Arc<SharedReadReservation>>,
 }
 
 fn try_read_permits(count: &Arc<Semaphore>, bytes: Option<&Arc<Semaphore>>, charge: u32) -> Result<ReadPermits, TryAcquireError> {
@@ -408,10 +525,16 @@ fn try_read_permits(count: &Arc<Semaphore>, bytes: Option<&Arc<Semaphore>>, char
     Ok(ReadPermits {
         _count: count,
         _bytes: bytes,
+        _shared_reservation: None,
     })
 }
 
-fn acquire_read_permits(count: Arc<Semaphore>, bytes: Option<Arc<Semaphore>>, charge: u32) -> AcquireFut {
+fn acquire_read_permits(
+    count: Arc<Semaphore>,
+    bytes: Option<Arc<Semaphore>>,
+    charge: u32,
+    shared_reservation: Option<Arc<SharedReadReservation>>,
+) -> AcquireFut {
     Box::pin(async move {
         // Every admission takes count before bytes. Pending reads need neither
         // resource to complete, so there is no inverse acquisition cycle.
@@ -423,6 +546,7 @@ fn acquire_read_permits(count: Arc<Semaphore>, bytes: Option<Arc<Semaphore>>, ch
         Ok(ReadPermits {
             _count: count,
             _bytes: bytes,
+            _shared_reservation: shared_reservation,
         })
     })
 }
@@ -432,6 +556,7 @@ fn acquire_read_permits(count: Arc<Semaphore>, bytes: Option<Arc<Semaphore>>, ch
 struct ByteAdmission {
     bytes: Arc<Semaphore>,
     registry: Mutex<AdmissionRegistry>,
+    shared_reservation: Option<Arc<SharedReadReservation>>,
 }
 
 #[derive(Default)]
@@ -445,6 +570,7 @@ impl ByteAdmission {
         Self {
             bytes: Arc::new(Semaphore::new(bytes)),
             registry: Mutex::new(AdmissionRegistry::default()),
+            shared_reservation: None,
         }
     }
 
@@ -958,6 +1084,42 @@ impl UringDriver {
     /// Saturated admission waits asynchronously and fairly on Tokio semaphores;
     /// dropping a waiting handle returns any partial reservation.
     pub fn probe_and_start_with_limits(entries: u32, shards: usize, limits: ReadLimits) -> Result<Self, ProbeFailure> {
+        Self::validate_read_limits(limits)?;
+        Self::start_with_limits(entries, shards, limits, None)
+    }
+
+    /// Reserve a whole driver budget from `budget`, then probe and start it.
+    ///
+    /// `limits.max_in_flight_bytes` must be explicitly set and nonzero. It
+    /// remains the driver's independent local byte limit, shared by its shards.
+    /// A limit larger than the pool capacity returns `ProbeFailure::Setup` with
+    /// `InvalidInput`; temporary reservation shortage returns `WouldBlock`
+    /// immediately, without probing or waiting for another driver to retire.
+    /// These errors have no restriction errno and do not imply io_uring is
+    /// unsupported. No fairness or automatic retry is promised.
+    ///
+    /// Startup failure refunds its reservation after partial shards are cleaned
+    /// up. Successful drivers keep it while idle, through shutdown and deferred
+    /// or accepted reads; a leaked pending read keeps the whole reservation.
+    /// Completed result buffers are not covered by this accounting.
+    pub fn probe_and_start_with_shared_budget(
+        entries: u32,
+        shards: usize,
+        limits: ReadLimits,
+        budget: &SharedReadBudget,
+    ) -> Result<Self, ProbeFailure> {
+        Self::validate_read_limits(limits)?;
+        let bytes = limits.max_in_flight_bytes.ok_or_else(|| {
+            ProbeFailure::Setup(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "shared read budget requires an explicit local byte limit",
+            ))
+        })?;
+        let reservation = budget.reserve(bytes).map_err(ProbeFailure::Setup)?;
+        Self::start_with_limits(entries, shards, limits, Some(reservation))
+    }
+
+    fn validate_read_limits(limits: ReadLimits) -> Result<(), ProbeFailure> {
         if limits
             .max_in_flight_bytes
             .is_some_and(|bytes| bytes == 0 || bytes > Semaphore::MAX_PERMITS)
@@ -967,7 +1129,20 @@ impl UringDriver {
                 "byte budget must be between 1 and Semaphore::MAX_PERMITS",
             )));
         }
-        let byte_admission = limits.max_in_flight_bytes.map(|bytes| Arc::new(ByteAdmission::new(bytes)));
+        Ok(())
+    }
+
+    fn start_with_limits(
+        entries: u32,
+        shards: usize,
+        limits: ReadLimits,
+        shared_reservation: Option<Arc<SharedReadReservation>>,
+    ) -> Result<Self, ProbeFailure> {
+        let byte_admission = limits.max_in_flight_bytes.map(|bytes| {
+            let mut admission = ByteAdmission::new(bytes);
+            admission.shared_reservation = shared_reservation;
+            Arc::new(admission)
+        });
         let mut started = Vec::with_capacity(shards.max(1));
         for i in 0..shards.max(1) {
             // Probe only the first shard (rustfs/backlog#1165): the probe read
@@ -1027,6 +1202,7 @@ impl UringDriver {
                         .map(|bytes| ReadPermits {
                             _count: count,
                             _bytes: bytes,
+                            _shared_reservation: None,
                         });
                     return (shard, permits);
                 }
@@ -1374,7 +1550,11 @@ impl UringDriver {
             // Fast path: a permit was free, so submit eagerly — no allocation,
             // no await, and the op is in flight the moment `submit` returns,
             // exactly as with the previous blocking implementation.
-            Ok(permit) => {
+            Ok(mut permit) => {
+                permit._shared_reservation = self
+                    .byte_admission
+                    .as_ref()
+                    .and_then(|admission| admission.shared_reservation.clone());
                 #[cfg(feature = "diagnostics")]
                 if let Some(timing) = &timing {
                     timing.enqueue();
@@ -1442,6 +1622,9 @@ impl UringDriver {
                         Arc::clone(&shard.sem),
                         self.byte_admission.as_ref().map(|admission| Arc::clone(&admission.bytes)),
                         charge,
+                        self.byte_admission
+                            .as_ref()
+                            .and_then(|admission| admission.shared_reservation.clone()),
                     ),
                     file,
                     offset,
@@ -2420,6 +2603,212 @@ fn drive(
 }
 
 #[cfg(test)]
+mod shared_budget_reservation_tests {
+    use super::*;
+
+    fn mock_driver(pool: &SharedReadBudget, bytes: usize, policy: ShardPolicy) -> (UringDriver, mpsc::Receiver<Msg>) {
+        let mut admission = ByteAdmission::new(bytes);
+        admission.shared_reservation = Some(pool.reserve(bytes).expect("reserve mock driver"));
+        let admission = Arc::new(admission);
+        let sem = Arc::new(Semaphore::new(1));
+        admission.register(&sem);
+        let (tx, rx) = mpsc::channel();
+        (
+            UringDriver {
+                limits: ReadLimits {
+                    max_read_len: None,
+                    max_in_flight_bytes: Some(bytes),
+                },
+                shard_policy: policy,
+                byte_admission: Some(admission),
+                shards: vec![Shard {
+                    tx,
+                    handle: None,
+                    stats: Arc::new(DriverStats::default()),
+                    sem,
+                    wake_efd: Arc::new(EventFd::new().expect("mock wake fd")),
+                }],
+                next_id: AtomicU64::new(1),
+                rr: AtomicUsize::new(0),
+            },
+            rx,
+        )
+    }
+
+    #[test]
+    fn pool_reserves_whole_weights_and_refunds_only_the_last_receipt_owner() {
+        assert_eq!(SharedReadBudget::new(0).expect_err("zero pool").kind(), io::ErrorKind::InvalidInput);
+        let pool = SharedReadBudget::new(12).expect("pool");
+        let alias = pool.clone();
+        let first = pool.reserve(8).expect("first driver");
+        let first_read = first.clone();
+        let second = alias.reserve(4).expect("second driver");
+        assert_eq!(pool.capacity(), 12);
+        assert_eq!(alias.available(), 0);
+        assert!(matches!(pool.reserve(1), Err(error) if error.kind() == io::ErrorKind::WouldBlock));
+        drop(first);
+        assert_eq!(pool.available(), 0, "an accepted read still owns the receipt");
+        drop(first_read);
+        assert_eq!(pool.available(), 8);
+        drop(second);
+        assert_eq!(pool.available(), 12);
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn whole_driver_reservations_do_not_narrow_to_u32_or_overflow_refunds() {
+        let pool = SharedReadBudget::new(usize::MAX).expect("large accounting-only pool");
+        let bytes = usize::try_from(u32::MAX).expect("64-bit usize") + 1;
+        let large = pool.reserve(bytes).expect("reservation above u32");
+        assert_eq!(pool.available(), usize::MAX - bytes);
+        let remaining = pool.reserve(usize::MAX - bytes).expect("reserve exact remainder");
+        assert_eq!(pool.available(), 0);
+        assert!(matches!(pool.reserve(1), Err(error) if error.kind() == io::ErrorKind::WouldBlock));
+        drop(remaining);
+        drop(large);
+        assert_eq!(pool.available(), usize::MAX);
+    }
+
+    #[test]
+    fn concurrent_reservations_never_exceed_pool_capacity() {
+        let pool = SharedReadBudget::new(17).expect("pool");
+        let gate = std::sync::Barrier::new(9);
+        let successful = AtomicUsize::new(0);
+        let unexpected_error = AtomicBool::new(false);
+        let observed = std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    gate.wait();
+                    let reservation = pool.reserve(3);
+                    match &reservation {
+                        Ok(_) => {
+                            successful.fetch_add(1, Ordering::SeqCst);
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                        Err(_) => {
+                            unexpected_error.store(true, Ordering::SeqCst);
+                        }
+                    }
+                    gate.wait();
+                    gate.wait();
+                    drop(reservation);
+                });
+            }
+            gate.wait();
+            gate.wait();
+            let observed = (pool.available(), successful.load(Ordering::SeqCst));
+            gate.wait();
+            observed
+        });
+        assert_eq!(observed, (2, 5));
+        assert!(!unexpected_error.load(Ordering::SeqCst));
+        assert_eq!(pool.available(), pool.capacity());
+    }
+
+    #[test]
+    fn invalid_and_temporarily_unavailable_driver_limits_fail_before_probing() {
+        let pool = SharedReadBudget::new(8).expect("pool");
+        for limit in [None, Some(0), Some(9), Some(Semaphore::MAX_PERMITS + 1)] {
+            let result = UringDriver::probe_and_start_with_shared_budget(
+                0,
+                1,
+                ReadLimits {
+                    max_read_len: None,
+                    max_in_flight_bytes: limit,
+                },
+                &pool,
+            );
+            let Err(error) = result else { panic!("invalid constructor must fail") };
+            assert!(!error.is_expected_restriction());
+            assert!(matches!(error, ProbeFailure::Setup(ref error) if error.kind() == io::ErrorKind::InvalidInput));
+            assert_eq!(pool.available(), 8);
+        }
+        let occupied = pool.reserve(8).expect("occupy pool");
+        let result = UringDriver::probe_and_start_with_shared_budget(
+            0,
+            1,
+            ReadLimits {
+                max_read_len: None,
+                max_in_flight_bytes: Some(1),
+            },
+            &pool,
+        );
+        let Err(error) = result else { panic!("insufficient shared budget must fail") };
+        assert!(!error.is_expected_restriction());
+        assert!(matches!(error, ProbeFailure::Setup(ref error) if error.kind() == io::ErrorKind::WouldBlock));
+        assert_eq!(pool.available(), 0);
+        drop(occupied);
+        assert_eq!(pool.available(), 8);
+    }
+
+    #[test]
+    fn eager_messages_keep_reservations_after_driver_and_caller_drop() {
+        for policy in [ShardPolicy::RoundRobin, ShardPolicy::CapacityAware] {
+            let pool = SharedReadBudget::new(8).expect("pool");
+            let (driver, messages) = mock_driver(&pool, 8, policy);
+            let handle = driver
+                .read_at(Arc::new(File::open("/dev/zero").expect("fixture file")), 0, 4)
+                .without_cancel_on_drop();
+            let message = messages.try_recv().expect("eager read enqueued");
+            assert!(matches!(message, Msg::Read { .. }));
+            drop(handle);
+            drop(driver);
+            assert_eq!(pool.available(), 0, "accepted message must retain the whole driver reservation");
+            drop(message);
+            assert_eq!(pool.available(), 8);
+        }
+    }
+
+    #[test]
+    fn deferred_admission_keeps_reservation_until_closed_poll_or_drop() {
+        for poll_closed in [false, true] {
+            let pool = SharedReadBudget::new(8).expect("pool");
+            let (driver, messages) = mock_driver(&pool, 8, ShardPolicy::RoundRobin);
+            let file = Arc::new(File::open("/dev/zero").expect("fixture file"));
+            let first = driver.read_at(file.clone(), 0, 8).without_cancel_on_drop();
+            let message = messages.try_recv().expect("first read owns local permits");
+            let mut waiting = driver.read_at(file, 0, 8);
+            assert!(matches!(waiting.state, HandleState::WaitingPermit { .. }));
+            drop(first);
+            drop(message);
+            drop(driver);
+            assert_eq!(pool.available(), 0, "deferred acquire owns the reservation before its first poll");
+            if poll_closed {
+                let result = Pin::new(&mut waiting).poll(&mut Context::from_waker(std::task::Waker::noop()));
+                assert!(matches!(result, Poll::Ready(Err(_))));
+                assert_eq!(pool.available(), 8, "closed acquire releases its receipt");
+            }
+            drop(waiting);
+            assert_eq!(pool.available(), 8);
+        }
+    }
+
+    #[test]
+    fn local_shutdown_does_not_close_another_participating_driver() {
+        let pool = SharedReadBudget::new(8).expect("pool");
+        let (first, _first_messages) = mock_driver(&pool, 4, ShardPolicy::RoundRobin);
+        let (second, second_messages) = mock_driver(&pool, 4, ShardPolicy::RoundRobin);
+        first.request_shutdown();
+        assert!(first.shards[0].sem.is_closed());
+        assert!(!second.shards[0].sem.is_closed());
+        assert!(!second.byte_admission.as_ref().expect("local budget").bytes.is_closed());
+        assert_eq!(pool.available(), 0, "shutdown request alone does not return an idle driver's reservation");
+        let read = second
+            .read_at(Arc::new(File::open("/dev/zero").expect("fixture file")), 0, 4)
+            .without_cancel_on_drop();
+        let message = second_messages.try_recv().expect("other driver still accepts reads");
+        assert!(matches!(message, Msg::Read { .. }));
+        drop(first);
+        assert_eq!(pool.available(), 4);
+        drop(second);
+        drop(read);
+        assert_eq!(pool.available(), 4, "second driver's queued operation still owns its reservation");
+        drop(message);
+        assert_eq!(pool.available(), 8);
+    }
+}
+
+#[cfg(test)]
 mod shutdown_request_tests {
     use super::*;
 
@@ -2468,7 +2857,7 @@ mod shutdown_request_tests {
         let (driver, messages) = mock_driver(1, None);
         let count = Arc::clone(&driver.shards[0].sem);
         let held = try_read_permits(&count, None, 1).expect("occupy mock shard");
-        let mut waiter = acquire_read_permits(count.clone(), None, 1);
+        let mut waiter = acquire_read_permits(count.clone(), None, 1, None);
         assert!(poll_acquire(&mut waiter).is_pending());
         driver.request_shutdown();
         assert!(count.is_closed());
@@ -2483,8 +2872,8 @@ mod shutdown_request_tests {
         let (driver, _messages) = mock_driver(2, Some(8));
         let bytes = Arc::clone(&driver.byte_admission.as_ref().expect("byte budget").bytes);
         let held = try_read_permits(&driver.shards[0].sem, Some(&bytes), 8).expect("occupy byte budget");
-        let mut count_waiter = acquire_read_permits(driver.shards[0].sem.clone(), Some(bytes.clone()), 8);
-        let mut byte_waiter = acquire_read_permits(driver.shards[1].sem.clone(), Some(bytes.clone()), 8);
+        let mut count_waiter = acquire_read_permits(driver.shards[0].sem.clone(), Some(bytes.clone()), 8, None);
+        let mut byte_waiter = acquire_read_permits(driver.shards[1].sem.clone(), Some(bytes.clone()), 8, None);
         assert!(poll_acquire(&mut count_waiter).is_pending());
         assert!(poll_acquire(&mut byte_waiter).is_pending());
         driver.request_shutdown();
@@ -2627,6 +3016,7 @@ mod cancellation_efficiency_tests {
             _permit: ReadPermits {
                 _count: Arc::clone(&sem).try_acquire_owned().expect("fixture permit"),
                 _bytes: None,
+                _shared_reservation: None,
             },
             pad: 0,
             head: 0,

@@ -49,6 +49,7 @@ fn pending_read(file: Arc<File>, count: &Arc<Semaphore>, bytes: &Arc<Semaphore>)
         _permit: ReadPermits {
             _count: Arc::clone(count).try_acquire_owned().unwrap(),
             _bytes: Some(Arc::clone(bytes).try_acquire_many_owned(16).unwrap()),
+            _shared_reservation: None,
         },
         pad: 0,
         head: 0,
