@@ -9,7 +9,7 @@ integration are separate gates; a checked code item does not close the roadmap.
 | 1.1–1.4: benchmark schema, timing, diagnostics, direct positive gate | Merged in [#15](https://github.com/rustfs/uring/pull/15), CI passed | Diagnostics overhead and real LocalIoBackend baseline |
 | 1.5: ABBA evidence tooling | Explicit same-binary calibration implemented/reviewed; 20 gate/cleanup tests pass | Stable native calibration, valid comparison and application integration |
 | 2.1–2.4: completion recovery, direct integrity, byte admission, guarantee boundaries | Implemented and independently reviewed; native regression suite passed | PR merge; application-wide limits remain separate |
-| 2.4 API follow-up: shutdown control and runtime adapter | Implemented with mock-thread and native regression tests; two independent code reviews passed | New-head native CI and PR merge |
+| 2.4 API follow-up: shutdown control and runtime adapter | Implemented/reviewed; native CI #55 passed at `a942ac1` | PR merge; no hard cleanup deadline or performance claim |
 | 3.1–3.3: bounded turns, explicit batch notifications, cancellation efficiency | Implemented and independently reviewed; native regression suite passed | CPU/syscall and tail-latency comparison; PR merge |
 | 4.1: capacity-aware routing | Implemented and independently reviewed, opt-in; native tests passed | Controlled slow-shard/mixed-load performance; PR merge |
 | 4.2: system-wide budgets and probe offload | Application probe offload, driver-thread budget and logical chunk limit implemented/reviewed in draft PRs #8072/#8074/#8076 | Full CI/merge; physical byte/result/io-wq budgets and [dependency wiring](rustfs-integration.md) remain open |
@@ -54,8 +54,15 @@ successful join, clean drain, and runtime-shutdown failure boundaries. Tests in
 Two independent code reviews found no blocking issue. Linux-target default
 all-target checking, all-feature Clippy, both feature-state rustdoc builds with
 warnings denied, formatting and diff checks pass locally. These are compilation
-checks, not native execution. New-head native CI is pending; previous CI does not
-validate these additions. No throughput or hard cleanup deadline is claimed.
+checks, not native execution. Subsequently, [CI #55](https://github.com/rustfs/uring/actions/runs/35794075169)
+at `a942ac1` passed all three jobs: 127 all-feature native tests (76 unit, 4
+admission, 21 read/cancel, 6 fault, 11 prefetch, 2 shard-policy, 7 shutdown), the
+mandatory O_DIRECT marker, ordered-prefetch and both benchmark CLI smokes, lint
+and 20 Python tests. Docker also passed restricted degradation and unrestricted
+native legs; its fault-injection-only build does not enable `tokio-runtime`.
+Later documentation-only commits do not change this tested implementation;
+their own workflow status remains separate. No throughput or hard cleanup
+deadline is claimed.
 
 `6927bb0` adds explicit same-binary calibration: identical executable content,
 zero diagnostics interval on every leg, unchanged endpoint drift thresholds,
