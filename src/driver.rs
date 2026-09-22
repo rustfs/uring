@@ -1848,6 +1848,26 @@ fn submit_ring(
     let Some(result) = submit_if_needed(&mut state.ring) else {
         return 0;
     };
+    handle_submit_result(result, stats, consecutive_submit_errors, submit_error_logged, shutting_down, || {
+        let ids: Vec<u64> = state.pending.keys().copied().collect();
+        for id in ids {
+            queue_cancel(&mut state.backlog, queued_cancels, id);
+        }
+    })
+}
+
+/// Classify a completed submit syscall without inferring which buffers the
+/// kernel owns. The callback only queues cancellation on the first shutdown
+/// transition; it never reclaims pending reads. Tests inject syscall results at
+/// this boundary, not into a real kernel ring.
+fn handle_submit_result(
+    result: io::Result<usize>,
+    stats: &DriverStats,
+    consecutive_submit_errors: &mut u32,
+    submit_error_logged: &mut bool,
+    shutting_down: &mut bool,
+    on_shutdown: impl FnOnce(),
+) -> usize {
     match result {
         Ok(submitted) => {
             *consecutive_submit_errors = 0;
@@ -1873,14 +1893,27 @@ fn submit_ring(
                     "uring driver: consecutive submit failures; shutting down so callers fall back to the std backend"
                 );
                 *shutting_down = true;
-                let ids: Vec<u64> = state.pending.keys().copied().collect();
-                for id in ids {
-                    queue_cancel(&mut state.backlog, queued_cancels, id);
-                }
+                on_shutdown();
             }
         }
     }
     0
+}
+
+#[cfg(test)]
+#[path = "driver_submit_result_tests.rs"]
+mod submit_result_tests;
+
+/// Publish changes to the kernel's cumulative u32 counter. Warn only for a new
+/// nonzero observation; a wrap to zero updates the snapshot and rearms logging
+/// for the next increment without emitting a misleading zero-overflow warning.
+fn update_cq_overflow(stats: &DriverStats, previous: &mut u32, observed: u32) -> bool {
+    if observed == *previous {
+        return false;
+    }
+    *previous = observed;
+    stats.cq_overflow.store(u64::from(observed), Ordering::SeqCst);
+    observed != 0
 }
 
 fn drive(
@@ -1902,6 +1935,7 @@ fn drive(
     // the persistent-submit-failure escape hatch (rustfs/backlog#1162).
     let mut consecutive_submit_errors: u32 = 0;
     let mut submit_error_logged = false;
+    let mut previous_cq_overflow = 0;
     // Ids with an AsyncCancel already queued, so a drop-cancel followed by a
     // shutdown (or vice versa) does not enqueue a second cancel for the same op —
     // keeping total completions <= 2*entries and CQ overflow unreachable
@@ -2200,8 +2234,7 @@ fn drive(
         // `entries` and cancels are deduped (at most one per op), keeping total
         // completions <= 2*entries, so this should stay 0 in practice.
         let overflow = state.ring.completion().overflow();
-        if overflow != 0 {
-            stats.cq_overflow.store(overflow as u64, Ordering::SeqCst);
+        if update_cq_overflow(&stats, &mut previous_cq_overflow, overflow) {
             tracing::warn!(
                 overflow,
                 "uring driver: CQ overflow; CQEs buffered (NODROP), not lost — backpressure warning"
