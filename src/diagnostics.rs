@@ -179,12 +179,20 @@ pub(crate) struct Trace {
 
 impl Trace {
     pub(crate) fn sample(diagnostics: &Arc<Diagnostics>) -> Option<Arc<Self>> {
+        Self::sample_with_start(diagnostics, Instant::now)
+    }
+
+    pub(crate) fn sample_since(diagnostics: &Arc<Diagnostics>, started: Instant) -> Option<Arc<Self>> {
+        Self::sample_with_start(diagnostics, || started)
+    }
+
+    fn sample_with_start(diagnostics: &Arc<Diagnostics>, start: impl FnOnce() -> Instant) -> Option<Arc<Self>> {
         // A global id modulo 64 would sample only shard zero for power-of-two
         // round-robin sharding. Each shard therefore owns its sampling sequence.
         let sequence = diagnostics.requests.fetch_add(1, Ordering::Relaxed);
         sequence.is_multiple_of(DIAGNOSTICS_SAMPLE_INTERVAL).then(|| {
             Arc::new(Self {
-                start: Instant::now(),
+                start: start(),
                 diagnostics: Arc::clone(diagnostics),
                 queued: AtomicU64::new(0),
                 entered: AtomicU64::new(0),

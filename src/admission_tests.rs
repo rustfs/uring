@@ -181,6 +181,7 @@ fn fake_driver(limits: ReadLimits) -> (UringDriver, mpsc::Receiver<Msg>) {
     (
         UringDriver {
             limits,
+            shard_policy: ShardPolicy::default(),
             byte_admission,
             shards: vec![Shard {
                 tx,

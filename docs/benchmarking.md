@@ -85,6 +85,15 @@ sample toward shard zero. Invalid requests can consume a sampling position
 without recording stages. Deterministic sampling is diagnostic, not an unbiased
 estimate for every possible periodic workload.
 
+With opt-in `ShardPolicy::CapacityAware`, positioned reads choose their owner
+before consuming that shard's sample sequence. Rejected geometry and unsuccessful
+candidate attempts do not consume sample positions; closed admission records no
+sample. For valid capacity-aware positioned reads, feature-on builds take one
+timestamp before selection even for unsampled reads, so sampled admission covers
+selection and permit acquisition (but excludes preceding geometry validation).
+Round-robin and stream sampling retain their original behavior. Measure this
+additional diagnostics cost with the selected routing policy.
+
 `UringDriver::diagnostics()` aggregates shards;
 `UringDriver::shard_diagnostics()` preserves shard identity. Each stage has a
 count, total nanoseconds, and 64 log2 nanosecond buckets. Bucket zero covers
@@ -117,7 +126,7 @@ even on std strategies (which do not use the instrumented driver).
 
 The default build compiles out timing fields, clock reads, histogram storage and
 sample allocations. Enabled builds add a per-shard atomic sampling counter per
-handle and an Arc/timestamps/histogram updates for sampled operations. Measure
+eligible handle and an Arc/timestamps/histogram updates for sampled operations. Measure
 that overhead on target hardware with separate feature-off/feature-on artifacts;
 do not assume it is free. Runtime schedule-latency and blocking-pool metrics must
 still be correlated in the application, which owns the Tokio runtime.
