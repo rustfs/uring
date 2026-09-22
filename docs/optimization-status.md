@@ -9,11 +9,12 @@ integration are separate gates; a checked code item does not close the roadmap.
 | 1.1–1.4: benchmark schema, timing, diagnostics, direct positive gate | Merged in [#15](https://github.com/rustfs/uring/pull/15), CI passed | Diagnostics overhead and real LocalIoBackend baseline |
 | 1.5: ABBA evidence tooling | Explicit same-binary calibration implemented/reviewed; 20 gate/cleanup tests pass | Stable native calibration, valid comparison and application integration |
 | 2.1–2.4: completion recovery, direct integrity, byte admission, guarantee boundaries | Implemented and independently reviewed; native regression suite passed | PR merge; application-wide limits remain separate |
+| 2.4 API follow-up: shutdown control and runtime adapter | Implemented with mock-thread and native regression tests; two independent code reviews passed | New-head native CI and PR merge |
 | 3.1–3.3: bounded turns, explicit batch notifications, cancellation efficiency | Implemented and independently reviewed; native regression suite passed | CPU/syscall and tail-latency comparison; PR merge |
 | 4.1: capacity-aware routing | Implemented and independently reviewed, opt-in; native tests passed | Controlled slow-shard/mixed-load performance; PR merge |
-| 4.2: system-wide budgets and probe offload | Current application main audited; integration not implemented | [Application dependency, fallback and cross-disk budget wiring](rustfs-integration.md) |
-| 5: owned buffers and direct FD cache | Not implemented | Profile evidence, lease/pool lifetime design and cache invalidation integration |
-| 6: ordered streaming prefetch | [Example-only contract experiment](ordered-prefetch.md) implemented/reviewed; 11 portable tests pass | Native example gate, production consumer contract, bitrot/S3 and performance evidence |
+| 4.2: system-wide budgets and probe offload | Application probe offload, driver-thread budget and logical chunk limit implemented/reviewed in draft PRs #8072/#8074/#8076 | Full CI/merge; physical byte/result/io-wq budgets and [dependency wiring](rustfs-integration.md) remain open |
+| 5: owned buffers and direct FD cache | Dual-mode exact invalidation implemented/reviewed in application draft PR #8075; direct caching and owned buffers not enabled | Full CI/merge, profile evidence, lease/pool lifetime and complete invalidation integration |
+| 6: ordered streaming prefetch | [Example-only contract experiment](ordered-prefetch.md) implemented/reviewed; 11 portable tests and native CLI CI #54 passed | Production consumer contract, bitrot/S3 and performance evidence |
 | 7: advanced ring/runtime modes | Not enabled or implemented | Earlier gates, capability/fallback and isolated benefit evidence |
 
 ## Correctness and review evidence
@@ -35,6 +36,26 @@ follow-up commits need their own CI; the live PR and tracking issue record
 final-head CI and merge status separately.
 
 ## Follow-up evidence and examples
+
+Application work is tracked in [RustFS #8072](https://github.com/rustfs/rustfs/pull/8072),
+[#8074](https://github.com/rustfs/rustfs/pull/8074),
+[#8075](https://github.com/rustfs/rustfs/pull/8075), and
+[#8076](https://github.com/rustfs/rustfs/pull/8076), not merged into application
+main. The first two passed their native io_uring tests but failed workspace and
+full E2E gates respectively; the latter two still have checks running. These
+partial results do not establish successful application integration.
+
+`c7bb321` adds non-joining shutdown requests, advisory thread completion and the
+default-off Tokio shutdown adapter. Count and byte admission close before a
+request returns; the adapter transfers ownership before its result future is
+polled. The [shutdown contract](shutdown.md) distinguishes thread completion,
+successful join, clean drain, and runtime-shutdown failure boundaries. Tests in
+`be66d8e` include real pending reads and an isolated nonclean-drain subprocess.
+Two independent code reviews found no blocking issue. Linux-target default
+all-target checking, all-feature Clippy, both feature-state rustdoc builds with
+warnings denied, formatting and diff checks pass locally. These are compilation
+checks, not native execution. New-head native CI is pending; previous CI does not
+validate these additions. No throughput or hard cleanup deadline is claimed.
 
 `6927bb0` adds explicit same-binary calibration: identical executable content,
 zero diagnostics interval on every leg, unchanged endpoint drift thresholds,
@@ -86,6 +107,7 @@ establish stable calibration without loosening gates after observing results.
 ## Contract references
 
 - [Public read and admission contracts](../README.md)
+- [Shutdown ownership and Tokio adapter](shutdown.md)
 - [Completion recovery and direct integrity](fault-recovery.md)
 - [Cancellation and eventfd behavior](cancellation-efficiency.md)
 - [Driver turn fairness](driver-fairness.md)
