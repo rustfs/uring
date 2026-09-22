@@ -779,3 +779,97 @@ async fn sharded_cancel_routes_to_the_owning_ring() {
     drop(pipe_write);
     driver.shutdown();
 }
+
+#[cfg(feature = "diagnostics")]
+#[tokio::test(flavor = "multi_thread")]
+async fn diagnostics_sample_stages_without_changing_read_results() {
+    let Some(driver) = sharded_driver_or_skip("diagnostics_sample_stages_without_changing_read_results", 2) else {
+        return;
+    };
+    let content = make_content(4096);
+    let (path, file) = temp_file_with(&content, "diagnostics");
+    let before = driver.diagnostics();
+    for _ in 0..130 {
+        let got = driver.read_at(Arc::clone(&file), 1, 512).await.expect("sampled read");
+        assert_eq!(got, &content[1..513]);
+    }
+    let after = driver.diagnostics();
+    let delta = after.since(&before);
+    for histogram in [
+        &delta.admission,
+        &delta.driver_queue,
+        &delta.preparation,
+        &delta.driver_lifetime,
+        &delta.cqe_processing,
+        &delta.completion_to_poll,
+    ] {
+        // Each shard accepts 65 handles and samples its first and 65th. Global
+        // id modulo 64 would miss one of the two round-robin shards entirely.
+        assert_eq!(histogram.count, 4, "{delta:?}");
+        assert_eq!(histogram.buckets.iter().sum::<u64>(), 4);
+    }
+    for shard in driver.shard_diagnostics() {
+        assert_eq!(shard.driver_lifetime.count, 2);
+    }
+    assert_eq!(after.since(&after), rustfs_uring::DiagnosticsSnapshot::default());
+    driver.shutdown();
+    let _ = std::fs::remove_file(path);
+}
+
+#[cfg(feature = "diagnostics")]
+#[tokio::test(flavor = "multi_thread")]
+async fn diagnostics_do_not_invent_receiver_samples_for_cancelled_reads() {
+    let Some(driver) = driver_or_skip("diagnostics_do_not_invent_receiver_samples_for_cancelled_reads") else {
+        return;
+    };
+    let (read, write) = os_pipe();
+    let handle = driver.read_current(read, 64); // sampled id 1
+    assert!(wait_until(Duration::from_secs(2), || driver.stats().in_flight == 1).await);
+    drop(handle);
+    assert!(wait_until(Duration::from_secs(2), || driver.stats().orphan_reclaimed == 1).await);
+    let snapshot = driver.diagnostics();
+    assert_eq!(snapshot.driver_lifetime.count, 1);
+    assert_eq!(snapshot.completion_to_poll.count, 0);
+    assert_eq!(snapshot.cqe_processing.count, 1);
+    driver.shutdown();
+    drop(write);
+}
+
+#[cfg(feature = "diagnostics")]
+#[tokio::test(flavor = "multi_thread")]
+async fn diagnostics_record_deferred_admission_only_after_a_permit_is_acquired() {
+    let driver = match UringDriver::probe_and_start(1) {
+        Ok(driver) => driver,
+        Err(error) => {
+            assert!(error.is_expected_restriction(), "{error}");
+            eprintln!("SKIP diagnostics_record_deferred_admission_only_after_a_permit_is_acquired: {error}");
+            return;
+        }
+    };
+    let (read, write) = os_pipe();
+    let held = driver.read_current(Arc::clone(&read), 64);
+    assert!(wait_until(Duration::from_secs(2), || driver.stats().in_flight == 1).await);
+    // Move this shard's sample sequence to its next sampled position without
+    // acquiring any additional permit or issuing a stream read.
+    for _ in 0..63 {
+        let error = driver
+            .read_at(Arc::clone(&read), u64::MAX, 1)
+            .await
+            .expect_err("reserved offset");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
+    let content = make_content(512);
+    let (path, file) = temp_file_with(&content, "diagnostics-deferred");
+    let deferred = driver.read_at(file, 0, 512);
+    assert_eq!(driver.diagnostics().admission.count, 1, "waiting is not admission");
+    drop(held);
+    assert_eq!(deferred.await.expect("permit is returned by cancelled read CQE"), content);
+    let diagnostics = driver.diagnostics();
+    assert_eq!(diagnostics.admission.count, 2);
+    assert_eq!(diagnostics.driver_queue.count, 2);
+    assert_eq!(diagnostics.driver_lifetime.count, 2);
+    assert_eq!(diagnostics.completion_to_poll.count, 1);
+    driver.shutdown();
+    drop(write);
+    let _ = std::fs::remove_file(path);
+}

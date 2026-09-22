@@ -57,7 +57,7 @@ use std::time::{Duration, Instant};
 
 use rustfs_uring::UringDriver;
 
-const CSV_HEADER: &str = "schema_version,mode,strategy,shards,file_size,read_size,concurrency,ops,secs,IOPS,MBps,p50_us,p99_us,p999_us,startup_secs,shutdown_secs,workers,ring_entries,warmup_ops";
+const CSV_HEADER: &str = "schema_version,mode,strategy,shards,file_size,read_size,concurrency,ops,secs,IOPS,MBps,p50_us,p99_us,p999_us,startup_secs,shutdown_secs,workers,ring_entries,warmup_ops,diagnostics_interval";
 
 /// Bound task fan-out independently of the configurable per-shard ring depth.
 const MAX_CONCURRENCY: usize = 4096;
@@ -455,6 +455,8 @@ pub(super) fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    #[cfg(feature = "diagnostics")]
+    let before = prepared.driver.as_ref().map(|driver| driver.diagnostics());
     let start = Instant::now();
     let mut lats = match rt.block_on(run(&cfg, &prepared, &prepared.offsets)) {
         Ok(l) => l,
@@ -464,6 +466,10 @@ pub(super) fn main() -> ExitCode {
         }
     };
     let secs = start.elapsed().as_secs_f64();
+    #[cfg(feature = "diagnostics")]
+    if let (Some(driver), Some(before)) = (&prepared.driver, &before) {
+        crate::common::report_diagnostics(&driver.diagnostics().since(before));
+    }
     // All operation tasks have joined. Drop the driver and runtime on this
     // synchronous thread, outside the steady-state measurement.
     let shutdown = Instant::now();
@@ -480,7 +486,7 @@ pub(super) fn main() -> ExitCode {
     let iops = ops as f64 / secs;
     let mbps = (ops as f64 * cfg.read_size as f64 / (1024.0 * 1024.0)) / secs;
     println!(
-        "2,{},{},{},{},{},{},{},{:.6},{:.0},{:.1},{},{},{},{:.6},{:.6},{},{},{}",
+        "2,{},{},{},{},{},{},{},{:.6},{:.0},{:.1},{},{},{},{:.6},{:.6},{},{},{},{}",
         if cfg.verify { "verify" } else { "measure" },
         cfg.strategy.name(),
         if cfg.strategy.uses_uring() { cfg.shards } else { 0 },
@@ -499,6 +505,7 @@ pub(super) fn main() -> ExitCode {
         cfg.workers,
         if cfg.strategy.uses_uring() { cfg.ring_entries } else { 0 },
         cfg.warmup_ops,
+        crate::common::diagnostics_interval(),
     );
     ExitCode::SUCCESS
 }

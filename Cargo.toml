@@ -33,6 +33,9 @@ categories = ["asynchronous", "filesystem"]
 # probe-drain leak paths deterministically. All gated code is `#[cfg(feature =
 # "fault-injection")]`, so a default build compiles none of it.
 fault-injection = []
+# Opt-in sampled timing. No timestamps, histogram storage, or tracing allocations
+# are compiled into the default driver.
+diagnostics = []
 
 [dependencies]
 # tracing for driver diagnostics: unifies with the RustFS tracing pipeline for

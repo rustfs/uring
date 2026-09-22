@@ -53,7 +53,7 @@ use std::time::Instant;
 
 use rustfs_uring::UringDriver;
 
-const CSV_HEADER: &str = "schema_version,mode,strategy,size,chunk,qd,align,bytes,secs,MBps,ops,startup_secs,shutdown_secs,workers,ring_entries,warmup_runs";
+const CSV_HEADER: &str = "schema_version,mode,strategy,size,chunk,qd,align,bytes,secs,MBps,ops,startup_secs,shutdown_secs,workers,ring_entries,warmup_runs,diagnostics_interval";
 
 /// Bound task fan-out independently of the configurable ring depth.
 const MAX_QD: usize = 4096;
@@ -454,9 +454,15 @@ fn run(cfg: &Config) -> Result<Measurement, String> {
         // Reset the sequential baseline outside the next timed interval.
         prepared.file.as_ref().rewind().map_err(|e| format!("rewind: {e}"))?;
     }
+    #[cfg(feature = "diagnostics")]
+    let before = prepared.driver.as_ref().map(|driver| driver.diagnostics());
     let start = Instant::now();
     let (total, ops) = run_once(cfg, &mut prepared, rt.as_ref())?;
     let secs = start.elapsed().as_secs_f64();
+    #[cfg(feature = "diagnostics")]
+    if let (Some(driver), Some(before)) = (&prepared.driver, &before) {
+        crate::common::report_diagnostics(&driver.diagnostics().since(before));
+    }
     let shutdown = Instant::now();
     drop(prepared);
     drop(rt);
@@ -513,7 +519,7 @@ pub(super) fn main() -> ExitCode {
     let mbps = (total as f64 / (1024.0 * 1024.0)) / secs;
     let uses_uring = matches!(cfg.strategy, Strategy::UringReadAt | Strategy::UringReadAtDirect);
     println!(
-        "2,{},{},{},{},{},{},{},{:.6},{:.1},{},{:.6},{:.6},{},{},{}",
+        "2,{},{},{},{},{},{},{},{:.6},{:.1},{},{:.6},{:.6},{},{},{},{}",
         if cfg.verify { "verify" } else { "measure" },
         cfg.strategy.name(),
         cfg.size,
@@ -529,6 +535,7 @@ pub(super) fn main() -> ExitCode {
         if uses_uring { cfg.workers } else { 0 },
         if uses_uring { cfg.ring_entries } else { 0 },
         cfg.warmup_runs,
+        crate::common::diagnostics_interval(),
     );
     ExitCode::SUCCESS
 }

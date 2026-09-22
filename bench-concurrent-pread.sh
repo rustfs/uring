@@ -47,7 +47,9 @@ ops_for() { # read_size -> op count, clamped
 }
 
 mkdir -p "$DIR"
-cargo build --locked --release --example concurrent_pread_bench >&2
+build_features=()
+if [[ "${BENCH_DIAGNOSTICS:-0}" == 1 ]]; then build_features=(--features diagnostics); fi
+cargo build --locked --release --example concurrent_pread_bench "${build_features[@]}" >&2
 
 # Correctness preflight (untimed; output discarded). IOPS cannot distinguish a
 # strategy that reads the right *number* of bytes from one that reads the wrong

@@ -44,7 +44,9 @@ read -r -a CHUNKS <<<"${CHUNKS:-131072 1048576}"
 read -r -a QDS <<<"${QDS:-1 4 16}"
 
 mkdir -p "$DIR"
-cargo build --locked --release --example streaming_bench >&2
+build_features=()
+if [[ "${BENCH_DIAGNOSTICS:-0}" == 1 ]]; then build_features=(--features diagnostics); fi
+cargo build --locked --release --example streaming_bench "${build_features[@]}" >&2
 
 # Correctness preflight (untimed; its output is discarded). Throughput cannot
 # distinguish a strategy that reads the right *number* of bytes from one that
