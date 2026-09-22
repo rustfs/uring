@@ -48,6 +48,7 @@ assert_eq!(snapshot.delivered + snapshot.orphan_reclaimed, snapshot.submitted);
 - `read_current(file, len)` — `read(2)` semantics from the current position, for pipes and other non-seekable fds (a short read is a valid final result).
 - `probe_and_start_sharded(entries, shards)` — several independent rings per disk (each ring caps at one core's memory bandwidth for cache-hit reads); `probe_and_start(entries)` equals `..._sharded(entries, 1)`.
 - `probe_and_start_with_limits(entries, shards, ReadLimits { max_read_len, max_in_flight_bytes })` — optional logical read-size and driver-wide read-buffer limits. Both fields default to `None`, preserving existing constructor behavior.
+- `probe_and_start_with_shared_budget(entries, shards, limits, &pool)` — reserve the driver's whole configured byte quota from a cloneable `SharedReadBudget` before startup. See [shared reservation ownership](docs/shared-read-budget.md); this is not dynamic per-read sharing or an RSS limit.
 - `with_shard_policy(ShardPolicy::CapacityAware)` — opt-in capacity-aware routing for positioned reads. Constructors keep `ShardPolicy::RoundRobin` by default.
 - `request_shutdown()` — close admission and request cancellation/drain without joining; `is_finished()` reports advisory thread completion, not a clean drain.
 - `shutdown_async()` — with the default-off `tokio-runtime` feature, transfer consuming cleanup to Tokio's blocking pool at method call time. See [shutdown ownership and runtime boundaries](docs/shutdown.md).
