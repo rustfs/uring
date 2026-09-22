@@ -113,13 +113,15 @@ def execute(command, env, stdout, stderr, timeout, unit):
             if code != 0:
                 raise RuntimeError(f"benchmark failed with exit code {code}; inspect the leg stderr")
         except BaseException:
-            if process.poll() is None:
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                finally:
-                    process.wait()
+            # The time wrapper can exit before its benchmark child. The owned
+            # process group can therefore still need cleanup after wait/poll
+            # has reaped its leader.
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            finally:
+                process.wait()
             raise
 
 
