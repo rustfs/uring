@@ -36,6 +36,9 @@ fault-injection = []
 # Opt-in sampled timing. No timestamps, histogram storage, or tracing allocations
 # are compiled into the default driver.
 diagnostics = []
+# Optional Tokio blocking-pool shutdown adapter. Default builds only require
+# Tokio's synchronization primitives and can drive reads from other executors.
+tokio-runtime = ["tokio/rt"]
 
 [dependencies]
 # tracing for driver diagnostics: unifies with the RustFS tracing pipeline for

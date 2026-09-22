@@ -1519,20 +1519,80 @@ impl UringDriver {
         shard.wake_efd.signal();
     }
 
-    /// Stop accepting work, cancel all in-flight ops, drain every ring to
-    /// `in_flight == 0`, then join each driver thread. Only after that is a ring
-    /// dropped/unmapped — the shutdown ordering P2 requires, per shard.
+    /// Close admission and ask every shard to cancel/drain, without joining
+    /// driver threads or waiting for pending reads to complete.
     ///
-    /// Shards are asked to stop first and joined afterwards, so their bounded
-    /// drains overlap instead of serializing `shards * DRAIN_TIMEOUT`.
-    pub fn shutdown(mut self) -> StatsSnapshot {
+    /// Count and byte waiters are woken with an admission error. An already
+    /// kernel-submitted operation still owns its buffer until its read CQE, or retains
+    /// it through the leak-over-UAF escape path. Concurrent and repeated calls
+    /// are safe; every call closes all admission before returning.
+    pub fn request_shutdown(&self) {
         if let Some(admission) = &self.byte_admission {
             admission.close();
+        }
+        // Also close count-only admission when byte limits are disabled. Do not
+        // use a once flag: a concurrent caller must not return before this work
+        // is complete merely because another caller started the request.
+        for shard in &self.shards {
+            shard.sem.close();
         }
         for shard in &self.shards {
             let _ = shard.tx.send(Msg::Shutdown);
             shard.wake_efd.signal();
         }
+    }
+
+    /// Advisory query: whether every driver thread's join handle reports
+    /// finished (or has already been joined). This does not join threads or
+    /// imply a clean drain; use [`Self::shutdown`] to join and inspect its stats.
+    ///
+    /// Inspect [`Self::stats`]: nonzero `in_flight` can remain after the bounded
+    /// drain leaks kernel-owned resources and the driver threads finish.
+    /// Like [`std::thread::JoinHandle::is_finished`], this can become true just
+    /// before final thread teardown completes; it is not proof of a completed
+    /// synchronous join and does not impose a deadline on a blocked syscall.
+    pub fn is_finished(&self) -> bool {
+        self.shards
+            .iter()
+            .all(|shard| shard.handle.as_ref().is_none_or(JoinHandle::is_finished))
+    }
+
+    /// Request shutdown immediately and move the consuming shutdown/join onto
+    /// the current Tokio runtime's blocking pool. Await the returned future for
+    /// the final snapshot, or an error if the blocking task fails to join.
+    ///
+    /// Available with `tokio-runtime`. This is deliberately not an `async fn`:
+    /// the driver is handed off when this method is called, before the returned
+    /// future is polled. Dropping that future, even unpolled, only detaches the
+    /// join handle; it does not cancel started blocking work or drop the driver
+    /// on the caller during normal runtime operation.
+    ///
+    /// Runtime shutdown may reject or discard blocking work and synchronously
+    /// drop its captured driver. Scheduling is not a hard cleanup deadline, and
+    /// neither this adapter nor a timeout can kill a hung kernel syscall. A
+    /// successful snapshot may still report leaked reads via nonzero `in_flight`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called without an entered Tokio runtime, matching
+    /// [`tokio::runtime::Handle::current`]. Unwinding then drops the driver using
+    /// its synchronous cleanup path.
+    #[cfg(feature = "tokio-runtime")]
+    pub fn shutdown_async(self) -> impl Future<Output = io::Result<StatsSnapshot>> + Send {
+        let runtime = tokio::runtime::Handle::current();
+        self.request_shutdown();
+        let shutdown = runtime.spawn_blocking(move || self.shutdown());
+        async move { shutdown.await.map_err(io::Error::other) }
+    }
+
+    /// Stop accepting work, cancel/drain every ring, and join the driver threads
+    /// synchronously. A clean drain returns `in_flight == 0`; a bounded-drain
+    /// escape can return a nonzero count with the ring and buffers still leaked.
+    ///
+    /// Shards are asked to stop first and joined afterwards, so their bounded
+    /// drains overlap instead of serializing `shards * DRAIN_TIMEOUT`.
+    pub fn shutdown(mut self) -> StatsSnapshot {
+        self.request_shutdown();
         for shard in &mut self.shards {
             shard.join();
         }
@@ -1554,17 +1614,11 @@ impl UringDriver {
 
 impl Drop for UringDriver {
     fn drop(&mut self) {
-        if let Some(admission) = &self.byte_admission {
-            admission.close();
-        }
         // Ask every shard to stop before joining any of them, so their bounded
         // drains overlap. Dropping the `Vec<Shard>` would instead run each
         // `Shard::drop` in turn, serializing up to `shards * DRAIN_TIMEOUT` on a
         // hung device. `Shard::join` is idempotent, so the later drops are no-ops.
-        for shard in &self.shards {
-            let _ = shard.tx.send(Msg::Shutdown);
-            shard.wake_efd.signal();
-        }
+        self.request_shutdown();
         for shard in &mut self.shards {
             shard.join();
         }
@@ -2362,6 +2416,194 @@ fn drive(
             !state.backlog.is_empty() || !state.ring.submission().is_empty(),
             submitted_before_reap.saturating_add(submitted_after_reap),
         );
+    }
+}
+
+#[cfg(test)]
+mod shutdown_request_tests {
+    use super::*;
+
+    fn mock_driver(shards: usize, bytes: Option<usize>) -> (UringDriver, Vec<mpsc::Receiver<Msg>>) {
+        let byte_admission = bytes.map(|limit| Arc::new(ByteAdmission::new(limit)));
+        let mut receivers = Vec::new();
+        let shards = (0..shards)
+            .map(|_| {
+                let (tx, rx) = mpsc::channel();
+                receivers.push(rx);
+                let sem = Arc::new(Semaphore::new(1));
+                if let Some(admission) = &byte_admission {
+                    admission.register(&sem);
+                }
+                Shard {
+                    tx,
+                    handle: None,
+                    stats: Arc::new(DriverStats::default()),
+                    sem,
+                    wake_efd: Arc::new(EventFd::new().expect("mock wake fd")),
+                }
+            })
+            .collect();
+        (
+            UringDriver {
+                limits: ReadLimits {
+                    max_read_len: None,
+                    max_in_flight_bytes: bytes,
+                },
+                shard_policy: ShardPolicy::RoundRobin,
+                byte_admission,
+                shards,
+                next_id: AtomicU64::new(1),
+                rr: AtomicUsize::new(0),
+            },
+            receivers,
+        )
+    }
+
+    fn poll_acquire(future: &mut AcquireFut) -> Poll<Result<ReadPermits, tokio::sync::AcquireError>> {
+        future.as_mut().poll(&mut Context::from_waker(std::task::Waker::noop()))
+    }
+
+    #[test]
+    fn request_shutdown_closes_count_only_admission_before_returning() {
+        let (driver, messages) = mock_driver(1, None);
+        let count = Arc::clone(&driver.shards[0].sem);
+        let held = try_read_permits(&count, None, 1).expect("occupy mock shard");
+        let mut waiter = acquire_read_permits(count.clone(), None, 1);
+        assert!(poll_acquire(&mut waiter).is_pending());
+        driver.request_shutdown();
+        assert!(count.is_closed());
+        assert!(matches!(poll_acquire(&mut waiter), Poll::Ready(Err(_))));
+        assert!(matches!(messages[0].try_recv(), Ok(Msg::Shutdown)));
+        assert_eq!(count.available_permits(), 0, "request must not reclaim accepted work");
+        drop(held);
+    }
+
+    #[test]
+    fn request_shutdown_wakes_both_admission_stages_without_reclaiming_buffers() {
+        let (driver, _messages) = mock_driver(2, Some(8));
+        let bytes = Arc::clone(&driver.byte_admission.as_ref().expect("byte budget").bytes);
+        let held = try_read_permits(&driver.shards[0].sem, Some(&bytes), 8).expect("occupy byte budget");
+        let mut count_waiter = acquire_read_permits(driver.shards[0].sem.clone(), Some(bytes.clone()), 8);
+        let mut byte_waiter = acquire_read_permits(driver.shards[1].sem.clone(), Some(bytes.clone()), 8);
+        assert!(poll_acquire(&mut count_waiter).is_pending());
+        assert!(poll_acquire(&mut byte_waiter).is_pending());
+        driver.request_shutdown();
+        assert!(matches!(poll_acquire(&mut count_waiter), Poll::Ready(Err(_))));
+        assert!(matches!(poll_acquire(&mut byte_waiter), Poll::Ready(Err(_))));
+        assert!(bytes.is_closed());
+        assert_eq!(bytes.available_permits(), 0, "in-flight reservation remains owned");
+        drop(held);
+    }
+
+    #[test]
+    fn concurrent_shutdown_requests_each_return_with_all_admission_closed() {
+        for bytes in [None, Some(8)] {
+            let (driver, _messages) = mock_driver(2, bytes);
+            let barrier = std::sync::Barrier::new(8);
+            std::thread::scope(|scope| {
+                for _ in 0..8 {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        for _ in 0..2 {
+                            driver.request_shutdown();
+                            assert!(driver.shards.iter().all(|shard| shard.sem.is_closed()));
+                            if let Some(admission) = &driver.byte_admission {
+                                assert!(admission.bytes.is_closed());
+                            }
+                        }
+                    });
+                }
+            });
+        }
+    }
+
+    #[tokio::test]
+    async fn finished_observes_thread_exit_not_request_or_clean_drain() {
+        let (mut driver, _messages) = mock_driver(1, None);
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (exit_tx, exit_rx) = mpsc::channel();
+        driver.shards[0].handle = Some(std::thread::spawn(move || {
+            entered_tx.send(()).expect("observe mock thread entry");
+            exit_rx.recv_timeout(Duration::from_secs(10)).expect("allow mock thread exit");
+        }));
+        entered_rx.await.expect("mock thread started");
+        assert!(!driver.is_finished());
+        driver.request_shutdown();
+        assert!(!driver.is_finished(), "request must return while a thread is still active");
+        // A synthetic leak counter illustrates that thread completion alone is
+        // not the clean-drain condition. No kernel ever touches this mock state.
+        driver.shards[0].stats.in_flight.store(1, Ordering::SeqCst);
+        exit_tx.send(()).expect("finish mock driver");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !driver.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("finished thread must become observable");
+        assert_eq!(driver.stats().in_flight, 1);
+        driver.shards[0].join();
+        assert!(driver.is_finished(), "joined handles also report finished");
+    }
+
+    #[cfg(feature = "tokio-runtime")]
+    #[test]
+    fn async_shutdown_transfers_driver_before_poll_and_unpolled_drop_does_not_join_caller() {
+        let (mut driver, _messages) = mock_driver(1, None);
+        let count = driver.shards[0].sem.clone();
+        let retired = Arc::downgrade(&driver.shards[0].stats);
+        let (driver_exit_tx, driver_exit_rx) = mpsc::channel();
+        driver.shards[0].handle = Some(std::thread::spawn(move || {
+            driver_exit_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("release mock driver thread");
+        }));
+        let (pool_release_tx, pool_release_rx) = mpsc::channel();
+        let (returned_tx, returned_rx) = mpsc::channel();
+        let (runtime_exit_tx, runtime_exit_rx) = mpsc::channel();
+        let caller = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .max_blocking_threads(1)
+                .build()
+                .expect("shutdown adapter runtime");
+            let (pool_entered_tx, pool_entered_rx) = mpsc::channel();
+            let _occupied = runtime.spawn_blocking(move || {
+                pool_entered_tx.send(()).expect("observe occupied blocking pool");
+                pool_release_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("release blocking pool");
+            });
+            pool_entered_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("pool task started");
+            {
+                let _entered = runtime.enter();
+                let future = driver.shutdown_async();
+                // The shutdown closure cannot start yet. Admission must already
+                // be closed at method return, not at the returned future's poll.
+                let closed_before_poll = count.is_closed();
+                drop(future);
+                returned_tx.send(closed_before_poll).expect("observe unpolled drop return");
+            }
+            runtime_exit_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("keep runtime alive until cleanup");
+        });
+
+        let returned = returned_rx.recv_timeout(Duration::from_secs(3));
+        // Release every gate before assertions, including on a broken adapter
+        // that joined on the caller and caused the observation to time out.
+        pool_release_tx.send(()).expect("allow shutdown closure to run");
+        driver_exit_tx.send(()).expect("allow driver join to finish");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while retired.strong_count() != 0 && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        let cleaned_up = retired.strong_count() == 0;
+        runtime_exit_tx.send(()).expect("allow runtime teardown");
+        caller.join().expect("shutdown caller thread");
+        assert!(returned.expect("unpolled drop must return without waiting for the mock driver"));
+        assert!(cleaned_up, "detached shutdown must still consume and drop the driver");
     }
 }
 
