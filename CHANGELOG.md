@@ -25,6 +25,9 @@ aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Non-joining `request_shutdown`, advisory `is_finished`, and a default-off
+  `tokio-runtime` feature for eager consuming `shutdown_async` ownership handoff.
+  Synchronous `shutdown`/`Drop` and bounded-drain leak guarantees remain explicit.
 - Explicit same-binary A/A calibration mode for the evidence runner, including
   individual middle-leg drift gates and no candidate attribution in control runs.
 - Example-only bounded ordered prefetch with deterministic backpressure,

@@ -49,6 +49,8 @@ assert_eq!(snapshot.delivered + snapshot.orphan_reclaimed, snapshot.submitted);
 - `probe_and_start_sharded(entries, shards)` — several independent rings per disk (each ring caps at one core's memory bandwidth for cache-hit reads); `probe_and_start(entries)` equals `..._sharded(entries, 1)`.
 - `probe_and_start_with_limits(entries, shards, ReadLimits { max_read_len, max_in_flight_bytes })` — optional logical read-size and driver-wide read-buffer limits. Both fields default to `None`, preserving existing constructor behavior.
 - `with_shard_policy(ShardPolicy::CapacityAware)` — opt-in capacity-aware routing for positioned reads. Constructors keep `ShardPolicy::RoundRobin` by default.
+- `request_shutdown()` — close admission and request cancellation/drain without joining; `is_finished()` reports advisory thread completion, not a clean drain.
+- `shutdown_async()` — with the default-off `tokio-runtime` feature, transfer consuming cleanup to Tokio's blocking pool at method call time. See [shutdown ownership and runtime boundaries](docs/shutdown.md).
 
 ### Shard selection
 
