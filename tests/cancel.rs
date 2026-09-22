@@ -28,7 +28,7 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use rustfs_uring::UringDriver;
+use rustfs_uring::{MAX_BATCH_READS, ReadLimits, ReadRequest, ShardPolicy, UringDriver};
 
 fn driver_or_skip(name: &str) -> Option<UringDriver> {
     match UringDriver::probe_and_start(64) {
@@ -78,6 +78,76 @@ fn temp_file_with(content: &[u8], tag: &str) -> (std::path::PathBuf, Arc<File>) 
     std::fs::write(&path, content).expect("write temp file");
     let file = Arc::new(File::open(&path).expect("open temp file"));
     (path, file)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn batch_reads_return_byte_exact_results_in_handle_order() {
+    let Some(driver) = sharded_driver_or_skip("batch_reads_return_byte_exact_results_in_handle_order", 2) else {
+        return;
+    };
+    let driver = driver.with_shard_policy(ShardPolicy::CapacityAware);
+    let content = make_content(8192);
+    let (path, file) = temp_file_with(&content, "batch-exact");
+    let requests = (0..MAX_BATCH_READS)
+        .map(|index| ReadRequest {
+            file: Arc::clone(&file),
+            offset: (index * 17) as u64,
+            len: 257,
+        })
+        .collect();
+    for (index, handle) in driver.read_at_batch(requests).unwrap().into_iter().enumerate() {
+        let bytes = tokio::time::timeout(Duration::from_secs(5), handle).await.unwrap().unwrap();
+        assert_eq!(bytes, &content[index * 17..index * 17 + 257]);
+    }
+    let stats = driver.shutdown();
+    assert_eq!(stats.submitted, MAX_BATCH_READS as u64);
+    assert_eq!(stats.delivered, stats.submitted);
+    assert_eq!(stats.in_flight, 0);
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn batch_cancellation_and_deferred_admission_drain_without_losing_live_results() {
+    let limits = ReadLimits {
+        max_read_len: Some(256),
+        max_in_flight_bytes: Some(512),
+    };
+    let driver = match UringDriver::probe_and_start_with_limits(2, 2, limits) {
+        Ok(driver) => driver.with_shard_policy(ShardPolicy::CapacityAware),
+        Err(error) => {
+            assert!(error.is_expected_restriction(), "{error}");
+            eprintln!("SKIP batch_cancellation_and_deferred_admission_drain_without_losing_live_results: {error}");
+            return;
+        }
+    };
+    let content = make_content(8192);
+    let (path, file) = temp_file_with(&content, "batch-cancel");
+    let requests = (0..MAX_BATCH_READS)
+        .map(|index| ReadRequest {
+            file: Arc::clone(&file),
+            offset: (index * 31) as u64,
+            len: 256,
+        })
+        .collect();
+    let mut retained = Vec::new();
+    for (index, handle) in driver.read_at_batch(requests).unwrap().into_iter().enumerate() {
+        if index % 2 == 0 {
+            drop(handle); // Accepted reads cancel; deferred reads submit nothing.
+        } else {
+            retained.push((index, handle));
+        }
+    }
+    for (index, handle) in retained {
+        let bytes = tokio::time::timeout(Duration::from_secs(5), handle).await.unwrap().unwrap();
+        assert_eq!(bytes, &content[index * 31..index * 31 + 256]);
+    }
+    assert!(wait_until(Duration::from_secs(2), || driver.stats().in_flight == 0).await);
+    let stats = driver.shutdown();
+    assert!(stats.submitted >= (MAX_BATCH_READS / 2) as u64);
+    assert_eq!(stats.submitted, stats.delivered + stats.orphan_reclaimed);
+    assert_eq!(stats.in_flight, 0);
+    // Completion can win the cancel race; no minimum successful cancel count.
+    let _ = std::fs::remove_file(path);
 }
 
 /// An OS pipe whose read side never completes until we write — the only

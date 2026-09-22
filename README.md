@@ -161,6 +161,10 @@ cargo test -- --nocapture --test-threads=1
 
 The harness fails on a non-degrading leg 1 or a vacuous-pass leg 2, so a skipped suite can never masquerade as coverage. The cancel-safety contract is pinned by the acceptance tests in `tests/cancel.rs`; the `fault-injection` feature (test-only) drives the panic-abort, bounded-drain-leak, and probe-failure escape hatches in `tests/fault_injection.rs`.
 
+For bounded buffered read groups, see [explicit batch reads](docs/batch-reads.md).
+`read_at_batch` shares eager notifications per owning shard while keeping each
+read's admission, result and cancellation independent.
+
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).
