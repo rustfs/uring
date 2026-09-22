@@ -28,6 +28,10 @@ use std::time::{Duration, Instant};
 
 use io_uring::{IoUring, opcode, types};
 
+#[cfg(test)]
+#[path = "admission_tests.rs"]
+mod admission_tests;
+
 #[cfg(feature = "diagnostics")]
 use crate::diagnostics::{Diagnostics, DiagnosticsSnapshot, Trace};
 
@@ -262,7 +266,7 @@ impl ProbeFailure {
 // resident memory and reopening the memory-DoS surface.
 //
 // That rule is now enforced by the type system rather than by a manual
-// `release()` call: the `OwnedSemaphorePermit` travels with `Msg::Read` into the
+// `release()` call: the count and optional byte permits travel with `Msg::Read` into the
 // `Pending` entry and is dropped exactly when the entry is removed at the final
 // CQE. A short-read resubmit keeps the entry — and thus the permit.
 //
@@ -272,7 +276,70 @@ impl ProbeFailure {
 // returned `ReadHandle`, which awaits it on its first poll and submits then.
 
 /// Boxed `Semaphore::acquire_owned` future held by a saturated `ReadHandle`.
-type AcquireFut = Pin<Box<dyn Future<Output = Result<OwnedSemaphorePermit, tokio::sync::AcquireError>> + Send>>;
+type AcquireFut = Pin<Box<dyn Future<Output = Result<ReadPermits, tokio::sync::AcquireError>> + Send>>;
+
+/// Optional resource limits shared by all shards of one driver.
+///
+/// Defaults preserve the existing count-only admission policy. Limits cover
+/// driver-owned read allocations, not queued handle metadata, allocator overhead,
+/// completion copies, or returned results retained by the caller. They are not
+/// a whole-process RSS bound.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReadLimits {
+    /// Maximum logical length of one read. `None` retains the kernel read cap.
+    /// A request exceeding this limit returns `InvalidInput` without allocation.
+    pub max_read_len: Option<usize>,
+    /// Maximum sum of reserved read-buffer bytes across all shards.
+    ///
+    /// Direct reads charge their aligned superset plus `align - 1` allocation
+    /// padding. Reservations start before allocation and end at terminal read
+    /// completion, including canceled operations; leaked operations stay charged.
+    /// Requests larger than this budget return `InvalidInput`, never wait.
+    /// Zero and values above Tokio's `Semaphore::MAX_PERMITS` are invalid.
+    /// Shutdown or any shard exit closes byte admission for the entire driver
+    /// when enabled, waking byte waiters even if buffers must be leaked.
+    pub max_in_flight_bytes: Option<usize>,
+}
+
+struct ReadPermits {
+    _count: OwnedSemaphorePermit,
+    _bytes: Option<OwnedSemaphorePermit>,
+}
+
+fn try_read_permits(count: &Arc<Semaphore>, bytes: Option<&Arc<Semaphore>>, charge: u32) -> Result<ReadPermits, TryAcquireError> {
+    let count = Arc::clone(count).try_acquire_owned()?;
+    let bytes = bytes.map(|sem| Arc::clone(sem).try_acquire_many_owned(charge)).transpose()?;
+    Ok(ReadPermits {
+        _count: count,
+        _bytes: bytes,
+    })
+}
+
+fn acquire_read_permits(count: Arc<Semaphore>, bytes: Option<Arc<Semaphore>>, charge: u32) -> AcquireFut {
+    Box::pin(async move {
+        // Every admission takes count before bytes. Pending reads need neither
+        // resource to complete, so there is no inverse acquisition cycle.
+        let count = count.acquire_owned().await?;
+        let bytes = match bytes {
+            Some(sem) => Some(sem.acquire_many_owned(charge).await?),
+            None => None,
+        };
+        Ok(ReadPermits {
+            _count: count,
+            _bytes: bytes,
+        })
+    })
+}
+
+struct CloseByteAdmission(Option<Arc<Semaphore>>);
+
+impl Drop for CloseByteAdmission {
+    fn drop(&mut self) {
+        if let Some(bytes) = &self.0 {
+            bytes.close();
+        }
+    }
+}
 
 #[derive(Default)]
 struct DriverStats {
@@ -342,7 +409,7 @@ enum Msg {
         /// released only when the pending entry is dropped at the final CQE
         /// (rustfs/backlog#1060/#1102). If the driver rejects the op (shutting
         /// down) the permit is dropped with the message — released immediately.
-        permit: OwnedSemaphorePermit,
+        permit: ReadPermits,
         /// Block size the read must be aligned to. `1` means a normal buffered
         /// read; `> 1` means the file was opened `O_DIRECT` and the driver must
         /// read the block-aligned superset range into a block-aligned buffer
@@ -401,7 +468,7 @@ struct Pending {
     offset: u64,
     /// Bytes already read into the read region (`buf[pad..]`).
     nread: usize,
-    _permit: OwnedSemaphorePermit,
+    _permit: ReadPermits,
     /// Offset inside `buf` where the block-aligned read region starts.
     pad: usize,
     /// Bytes of the read region that precede the caller's logical range.
@@ -601,8 +668,8 @@ impl Drop for ReadHandle {
     fn drop(&mut self) {
         // The buffer is deliberately NOT touched here: the driver owns it
         // until the CQE. All we may do is ask the kernel to hurry up. A handle
-        // dropped before it was submitted (Inert / WaitingPermit) has no buffer,
-        // no permit and no SQE, so there is nothing to cancel.
+        // dropped before it was submitted (Inert / WaitingPermit) has no buffer
+        // and no SQE. A waiting handle releases any partial reservation by drop.
         if let HandleState::Submitted { wake } = &self.state
             && !self.finished
             && self.cancel_on_drop
@@ -672,6 +739,8 @@ impl Drop for Shard {
 /// kernel. Construct it through [`UringDriver::probe_and_start`] so restricted
 /// environments can fall back to a blocking backend before serving traffic.
 pub struct UringDriver {
+    limits: ReadLimits,
+    byte_sem: Option<Arc<Semaphore>>,
     /// One or more independent rings. A cache-hit buffered read completes inline
     /// inside `io_uring_enter`, so the thread driving a ring performs that
     /// read's memcpy — which caps a single-ring driver at one core's memory
@@ -714,6 +783,26 @@ impl UringDriver {
     /// later shard fails to start, the ones already running are shut down and
     /// joined before the error is returned.
     pub fn probe_and_start_sharded(entries: u32, shards: usize) -> Result<Self, ProbeFailure> {
+        Self::probe_and_start_with_limits(entries, shards, ReadLimits::default())
+    }
+
+    /// Start one or more shards with opt-in logical-size and read-allocation limits.
+    ///
+    /// Ring setup and probing follow [`Self::probe_and_start_sharded`]. Invalid
+    /// limits return [`ProbeFailure::Setup`] with `InvalidInput` before probing.
+    /// Saturated admission waits asynchronously and fairly on Tokio semaphores;
+    /// dropping a waiting handle returns any partial reservation.
+    pub fn probe_and_start_with_limits(entries: u32, shards: usize, limits: ReadLimits) -> Result<Self, ProbeFailure> {
+        if limits
+            .max_in_flight_bytes
+            .is_some_and(|bytes| bytes == 0 || bytes > Semaphore::MAX_PERMITS)
+        {
+            return Err(ProbeFailure::Setup(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "byte budget must be between 1 and Semaphore::MAX_PERMITS",
+            )));
+        }
+        let byte_sem = limits.max_in_flight_bytes.map(|bytes| Arc::new(Semaphore::new(bytes)));
         let mut started = Vec::with_capacity(shards.max(1));
         for i in 0..shards.max(1) {
             // Probe only the first shard (rustfs/backlog#1165): the probe read
@@ -722,9 +811,11 @@ impl UringDriver {
             // verify NODROP — this avoids `shards - 1` extra O_TMPFILE
             // create+write+read round-trips per disk on every start and renew.
             // `?` drops `started`, whose `Shard::drop` joins each running thread.
-            started.push(Self::start_shard(entries, i == 0)?);
+            started.push(Self::start_shard(entries, i == 0, byte_sem.clone())?);
         }
         Ok(Self {
+            limits,
+            byte_sem,
             shards: started,
             next_id: AtomicU64::new(1),
             rr: AtomicUsize::new(0),
@@ -739,7 +830,7 @@ impl UringDriver {
         &self.shards[self.rr.fetch_add(1, Ordering::Relaxed) % n]
     }
 
-    fn start_shard(entries: u32, probe: bool) -> Result<Shard, ProbeFailure> {
+    fn start_shard(entries: u32, probe: bool, byte_sem: Option<Arc<Semaphore>>) -> Result<Shard, ProbeFailure> {
         let mut ring = IoUring::new(entries).map_err(ProbeFailure::Setup)?;
         // Require the NODROP feature (kernel >= 5.5). Without it, CQ overflow
         // silently drops CQEs, stranding pending entries forever and hanging
@@ -799,7 +890,10 @@ impl UringDriver {
         // (moved into the closure) drop cleanly with no SQE in flight.
         let handle = std::thread::Builder::new()
             .name("uring-spike-driver".into())
-            .spawn(move || drive(ring, rx, thread_stats, thread_sem, cq_efd, thread_wake))
+            .spawn(move || {
+                let _close_bytes = CloseByteAdmission(byte_sem);
+                drive(ring, rx, thread_stats, thread_sem, cq_efd, thread_wake);
+            })
             .map_err(ProbeFailure::Setup)?;
 
         Ok(Shard {
@@ -909,10 +1003,10 @@ impl UringDriver {
         // rustfs/backlog#1057). Failing fast here also removes the caller-
         // controlled `vec![0u8; len]` capacity-overflow panic that made the
         // unwind-UAF (rustfs/backlog#1054) reachable. P2 must chunk instead.
-        if len > MAX_READ_LEN {
+        if len > MAX_READ_LEN || self.limits.max_read_len.is_some_and(|max| len > max) {
             let _ = done.send(Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "read length exceeds MAX_RW_COUNT (2 GiB - 4 KiB); caller must chunk",
+                "read length exceeds MAX_RW_COUNT or configured logical read limit; caller must chunk",
             )));
             return ReadHandle {
                 id,
@@ -934,7 +1028,7 @@ impl UringDriver {
         // submit (rustfs/backlog#1102, #1166). Pre-empting it here also makes
         // every resubmit's `next_off < kernel_offset + region_len` provably
         // <= i64::MAX. `align == 1` (buffered) always passes the alignment part.
-        match aligned_geometry(offset, len, align) {
+        let allocation_bytes = match aligned_geometry(offset, len, align) {
             // CURRENT_POSITION (stream) reads use no positional offset — the
             // kernel reads from the current file position — so the i64::MAX end
             // check does not apply to them (their sentinel offset would overflow
@@ -944,7 +1038,10 @@ impl UringDriver {
                     && (allow_current_position && offset == CURRENT_POSITION
                         || kernel_offset
                             .checked_add(region_len as u64)
-                            .is_some_and(|end| end <= i64::MAX as u64)) => {}
+                            .is_some_and(|end| end <= i64::MAX as u64)) =>
+            {
+                region_len + align - 1
+            }
             _ => {
                 let _ = done.send(Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -961,13 +1058,30 @@ impl UringDriver {
                     state: HandleState::Inert,
                 };
             }
+        };
+
+        if self.limits.max_in_flight_bytes.is_some_and(|max| allocation_bytes > max) {
+            let _ = done.send(Err(io::Error::new(io::ErrorKind::InvalidInput, "aligned allocation exceeds byte budget")));
+            return ReadHandle {
+                id,
+                #[cfg(feature = "diagnostics")]
+                timing,
+                rx,
+                tx: shard.tx.clone(),
+                finished: false,
+                cancel_on_drop: false,
+                state: HandleState::Inert,
+            };
         }
+        // Both region and alignment are capped at MAX_READ_LEN, so their sum
+        // fits u32, even on 32-bit Linux. Charge the exact Vec allocation length.
+        let charge = allocation_bytes as u32;
 
         // Take a backpressure permit BEFORE the op reaches the driver; it is
         // released only when the pending entry is dropped at the CQE (C10,
         // rustfs/backlog#1060). Acquisition never blocks the caller's thread
         // (rustfs/backlog#1102).
-        match Arc::clone(&shard.sem).try_acquire_owned() {
+        match try_read_permits(&shard.sem, self.byte_sem.as_ref(), charge) {
             // Fast path: a permit was free, so submit eagerly — no allocation,
             // no await, and the op is in flight the moment `submit` returns,
             // exactly as with the previous blocking implementation.
@@ -1033,7 +1147,7 @@ impl UringDriver {
                 finished: false,
                 cancel_on_drop: true,
                 state: HandleState::WaitingPermit {
-                    acquire: Box::pin(Arc::clone(&shard.sem).acquire_owned()),
+                    acquire: acquire_read_permits(Arc::clone(&shard.sem), self.byte_sem.clone(), charge),
                     file,
                     offset,
                     len,
@@ -1117,6 +1231,9 @@ impl UringDriver {
     /// Shards are asked to stop first and joined afterwards, so their bounded
     /// drains overlap instead of serializing `shards * DRAIN_TIMEOUT`.
     pub fn shutdown(mut self) -> StatsSnapshot {
+        if let Some(bytes) = &self.byte_sem {
+            bytes.close();
+        }
         for shard in &self.shards {
             let _ = shard.tx.send(Msg::Shutdown);
             shard.wake_efd.signal();
@@ -1142,6 +1259,9 @@ impl UringDriver {
 
 impl Drop for UringDriver {
     fn drop(&mut self) {
+        if let Some(bytes) = &self.byte_sem {
+            bytes.close();
+        }
         // Ask every shard to stop before joining any of them, so their bounded
         // drains overlap. Dropping the `Vec<Shard>` would instead run each
         // `Shard::drop` in turn, serializing up to `shards * DRAIN_TIMEOUT` on a

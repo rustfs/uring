@@ -55,4 +55,4 @@ mod diagnostics;
 pub use diagnostics::{DIAGNOSTICS_SAMPLE_INTERVAL, DiagnosticsSnapshot, LatencyHistogram};
 
 #[cfg(target_os = "linux")]
-pub use driver::{ProbeFailure, ReadHandle, StatsSnapshot, UringDriver};
+pub use driver::{ProbeFailure, ReadHandle, ReadLimits, StatsSnapshot, UringDriver};

@@ -47,6 +47,33 @@ assert_eq!(snapshot.delivered + snapshot.orphan_reclaimed, snapshot.submitted);
 - `read_at_direct(file, offset, len, align)` — the same for an `O_DIRECT` fd; `offset`/`len` need not be aligned (the driver reads a block-aligned superset and returns exactly the requested range).
 - `read_current(file, len)` — `read(2)` semantics from the current position, for pipes and other non-seekable fds (a short read is a valid final result).
 - `probe_and_start_sharded(entries, shards)` — several independent rings per disk (each ring caps at one core's memory bandwidth for cache-hit reads); `probe_and_start(entries)` equals `..._sharded(entries, 1)`.
+- `probe_and_start_with_limits(entries, shards, ReadLimits { max_read_len, max_in_flight_bytes })` — optional logical read-size and driver-wide read-buffer limits. Both fields default to `None`, preserving existing constructor behavior.
+
+### Read allocation admission
+
+With `max_in_flight_bytes: Some(budget)`, all shards share one byte budget.
+Buffered reads reserve `len` bytes; direct reads reserve the block-aligned
+superset length plus `align - 1` bytes of allocation padding, including for
+zero-length direct reads. A request whose allocation exceeds the entire budget,
+or whose logical length exceeds `max_read_len`, returns `InvalidInput` before
+allocation. A byte budget of zero or above `tokio::sync::Semaphore::MAX_PERMITS`
+is rejected at construction. `max_read_len: Some(0)` allows only zero-length reads.
+
+Admission acquires the shard's count permit before its byte permits. Saturated
+handles wait asynchronously, holding no read buffer; a byte waiter may hold a
+count permit, and Tokio's fair byte semaphore can put small reads behind a large
+waiter. Dropping a waiting handle returns all partial reservations. After enqueue,
+both permits travel with the read until its terminal CQE, even if its caller is
+canceled. Short-read retries retain the same reservation. A leaked read retains
+its charge. Shutdown closes the byte semaphore immediately; any shard-thread exit
+also closes it for the whole driver, conservatively rejecting further byte
+admission and waking byte waiters even on a bounded-drain escape.
+
+This limits reserved driver read-buffer allocation bytes, **not process RSS**.
+It excludes queued handle/FD metadata, allocator overhead, result copies and
+completed `Vec` results retained in channels or by callers. The caller must bound
+its task fan-out and result queue separately. Completion releases admission even
+when the returned result remains alive.
 
 ## API contract
 
