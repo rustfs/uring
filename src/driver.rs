@@ -36,6 +36,10 @@ mod admission_tests;
 #[path = "shard_policy_tests.rs"]
 mod shard_policy_tests;
 
+#[cfg(test)]
+#[path = "batch_read_tests.rs"]
+mod batch_read_tests;
+
 #[cfg(feature = "diagnostics")]
 use crate::diagnostics::{Diagnostics, DiagnosticsSnapshot, Trace};
 
@@ -854,8 +858,8 @@ struct Shard {
     /// when the driver thread exits so any waiting `ReadHandle` resolves with a
     /// driver-gone error instead of hanging (rustfs/backlog#1102).
     sem: Arc<Semaphore>,
-    /// Signaled after every message send so this shard's loop wakes immediately
-    /// instead of waiting out the heartbeat (backlog#1102).
+    /// Signaled after message sends (once per shard for an explicit eager batch)
+    /// so the loop wakes without waiting out the heartbeat (backlog#1102).
     wake_efd: Arc<EventFd>,
 }
 
@@ -899,6 +903,20 @@ pub struct UringDriver {
     /// Round-robin cursor for shard selection. Relaxed: it only has to spread
     /// ops, never to order them.
     rr: AtomicUsize,
+}
+
+/// Maximum requests accepted by one [`UringDriver::read_at_batch`] call.
+pub const MAX_BATCH_READS: usize = 64;
+
+/// One buffered positioned read in an explicit notification batch.
+#[derive(Debug)]
+pub struct ReadRequest {
+    /// File whose ownership is retained through completion of an accepted read.
+    pub file: Arc<File>,
+    /// Positioned byte offset, with the same validation as [`UringDriver::read_at`].
+    pub offset: u64,
+    /// Logical byte count, subject to the driver's configured read limits.
+    pub len: usize,
 }
 
 impl UringDriver {
@@ -1122,12 +1140,50 @@ impl UringDriver {
     /// [`Self::read_current`] and is returned as an asynchronous
     /// `io::ErrorKind::InvalidInput` result rather than panicking.
     pub fn read_at(&self, file: Arc<File>, offset: u64, len: usize) -> ReadHandle {
-        self.submit(file, offset, len, 1, false)
+        self.submit(file, offset, len, 1, false, true)
+    }
+
+    /// Create handles in input order for up to [`MAX_BATCH_READS`] buffered positioned reads.
+    ///
+    /// Eagerly accepted requests share one notification per owning shard after
+    /// constructing the handles. Saturated requests retain normal asynchronous
+    /// admission and notify their own shard when polled and admitted. The batch
+    /// is not atomic and does not guarantee completion order or snapshot reads.
+    /// Empty batches send no notification. Dropping any handle retains normal
+    /// cancel safety, including during unwinding of interrupted construction.
+    ///
+    /// # Errors
+    ///
+    /// More than [`MAX_BATCH_READS`] requests returns `InvalidInput` before any
+    /// submission. Individual invalid requests return errors from their handles,
+    /// exactly like [`Self::read_at`]; they do not reject other batch members.
+    pub fn read_at_batch(&self, requests: Vec<ReadRequest>) -> io::Result<Vec<ReadHandle>> {
+        if requests.len() > MAX_BATCH_READS {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "read batch exceeds MAX_BATCH_READS"));
+        }
+        let mut handles = Vec::with_capacity(requests.len());
+        let mut wakes: Vec<Arc<EventFd>> = Vec::with_capacity(requests.len());
+        for ReadRequest { file, offset, len } in requests {
+            let handle = self.submit(file, offset, len, 1, false, false);
+            if let HandleState::Submitted { wake } = &handle.state
+                && !wakes.iter().any(|queued| Arc::ptr_eq(queued, wake))
+            {
+                wakes.push(Arc::clone(wake));
+            }
+            // A partially built vector owns every submitted handle. If a later
+            // construction unwinds, their Drop sends cancels and signals the
+            // final owner, so delayed batch notification cannot strand reads.
+            handles.push(handle);
+        }
+        for wake in wakes {
+            wake.signal();
+        }
+        Ok(handles)
     }
 
     /// Read at the file's current position (read(2) semantics) — pipes.
     pub fn read_current(&self, file: Arc<File>, len: usize) -> ReadHandle {
-        self.submit(file, CURRENT_POSITION, len, 1, true)
+        self.submit(file, CURRENT_POSITION, len, 1, true, true)
     }
 
     /// Positioned read from a file opened with `O_DIRECT` (rustfs/backlog#1102).
@@ -1146,10 +1202,18 @@ impl UringDriver {
     /// A non-aligned short read that does not cover the requested range succeeds
     /// only when metadata confirms EOF; a failed metadata lookup returns an error.
     pub fn read_at_direct(&self, file: Arc<File>, offset: u64, len: usize, align: usize) -> ReadHandle {
-        self.submit(file, offset, len, align, false)
+        self.submit(file, offset, len, align, false, true)
     }
 
-    fn submit(&self, file: Arc<File>, offset: u64, len: usize, align: usize, allow_current_position: bool) -> ReadHandle {
+    fn submit(
+        &self,
+        file: Arc<File>,
+        offset: u64,
+        len: usize,
+        align: usize,
+        allow_current_position: bool,
+        notify_now: bool,
+    ) -> ReadHandle {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         assert_eq!(id & CANCEL_BIT, 0, "op id overflowed into the cancel bit");
         let (done, rx) = oneshot::channel();
@@ -1346,7 +1410,9 @@ impl UringDriver {
                     };
                 }
                 // Wake the driver loop so the read starts immediately.
-                shard.wake_efd.signal();
+                if notify_now {
+                    shard.wake_efd.signal();
+                }
                 ReadHandle {
                     id,
                     #[cfg(feature = "diagnostics")]
