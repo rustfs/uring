@@ -48,6 +48,34 @@ assert_eq!(snapshot.delivered + snapshot.orphan_reclaimed, snapshot.submitted);
 - `read_current(file, len)` — `read(2)` semantics from the current position, for pipes and other non-seekable fds (a short read is a valid final result).
 - `probe_and_start_sharded(entries, shards)` — several independent rings per disk (each ring caps at one core's memory bandwidth for cache-hit reads); `probe_and_start(entries)` equals `..._sharded(entries, 1)`.
 - `probe_and_start_with_limits(entries, shards, ReadLimits { max_read_len, max_in_flight_bytes })` — optional logical read-size and driver-wide read-buffer limits. Both fields default to `None`, preserving existing constructor behavior.
+- `with_shard_policy(ShardPolicy::CapacityAware)` — opt-in capacity-aware routing for positioned reads. Constructors keep `ShardPolicy::RoundRobin` by default.
+
+### Shard selection
+
+Round-robin binds each read to the next shard, even if that shard is busy or
+closed. Capacity-aware selection starts at the same cursor and tries each shard's
+count permit at most once, skipping closed count semaphores. It uses actual
+permit acquisition, not a free-capacity snapshot. If all healthy shards are busy,
+the handle waits on the first healthy candidate using Tokio's fair semaphore.
+The wait is local to that shard; it does not rebalance when another shard frees.
+
+A shared byte-budget shortage waits on the first shard whose count permit was
+available, returning that temporary count reservation before constructing the
+waiter. A closed shared byte budget rejects admission globally. Once a read is
+accepted or deferred, its read, wakeup, retry, and cancel retain the same owning
+shard. `read_current` always keeps the original round-robin behavior; concurrent
+stream reads still require caller serialization when ordering matters.
+
+Enable the policy explicitly on the constructed driver before sharing it:
+
+```rust,ignore
+let driver = UringDriver::probe_and_start_sharded(128, 4)?
+    .with_shard_policy(rustfs_uring::ShardPolicy::CapacityAware);
+```
+
+This policy has additional admission work under contention. Throughput, CPU cost,
+and tail-latency acceptance remain pending target-hardware measurements; it is
+not enabled by default.
 
 ### Read allocation admission
 

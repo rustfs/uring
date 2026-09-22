@@ -32,6 +32,10 @@ use io_uring::{IoUring, opcode, types};
 #[path = "admission_tests.rs"]
 mod admission_tests;
 
+#[cfg(test)]
+#[path = "shard_policy_tests.rs"]
+mod shard_policy_tests;
+
 #[cfg(feature = "diagnostics")]
 use crate::diagnostics::{Diagnostics, DiagnosticsSnapshot, Trace};
 
@@ -373,6 +377,20 @@ pub struct ReadLimits {
     /// Shutdown or any shard exit closes count and byte admission for the entire
     /// driver when enabled, waking all waiters even if buffers must be leaked.
     pub max_in_flight_bytes: Option<usize>,
+}
+
+/// Shard selection for positioned reads. Stream reads retain round-robin routing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ShardPolicy {
+    /// Bind to the next shard even when its admission is full or closed.
+    #[default]
+    RoundRobin,
+    /// Starting at the round-robin cursor, try each shard's count permit once,
+    /// skipping closed shards. If every healthy shard is full, wait fairly on
+    /// the first healthy shard. A shared byte-budget shortage waits on the first
+    /// shard with count capacity; a closed byte budget terminates admission.
+    /// Accepted and waiting reads never migrate to another shard.
+    CapacityAware,
 }
 
 struct ReadPermits {
@@ -868,6 +886,7 @@ impl Drop for Shard {
 /// environments can fall back to a blocking backend before serving traffic.
 pub struct UringDriver {
     limits: ReadLimits,
+    shard_policy: ShardPolicy,
     byte_admission: Option<Arc<ByteAdmission>>,
     /// One or more independent rings. A cache-hit buffered read completes inline
     /// inside `io_uring_enter`, so the thread driving a ring performs that
@@ -943,6 +962,7 @@ impl UringDriver {
         }
         Ok(Self {
             limits,
+            shard_policy: ShardPolicy::default(),
             byte_admission,
             shards: started,
             next_id: AtomicU64::new(1),
@@ -950,9 +970,69 @@ impl UringDriver {
         })
     }
 
+    /// Set the policy for future positioned reads, independently of resource limits.
+    ///
+    /// Existing handles retain their owning shard. [`Self::read_current`] keeps
+    /// round-robin behavior under either policy; callers must still serialize
+    /// stream reads themselves when ordering matters. Capacity-aware selection
+    /// is opt-in and has not established a throughput or latency improvement.
+    #[must_use]
+    pub fn with_shard_policy(mut self, policy: ShardPolicy) -> Self {
+        self.shard_policy = policy;
+        self
+    }
+
+    fn select_read_shard(
+        &self,
+        start: usize,
+        charge: u32,
+        capacity_aware: bool,
+    ) -> (&Shard, Result<ReadPermits, TryAcquireError>) {
+        let first = &self.shards[start];
+        let bytes = self.byte_admission.as_ref().map(|admission| &admission.bytes);
+        if !capacity_aware {
+            return (first, try_read_permits(&first.sem, bytes, charge));
+        }
+        if bytes.is_some_and(|sem| sem.is_closed()) {
+            return (first, Err(TryAcquireError::Closed));
+        }
+        let mut waiting = None;
+        for index in (start..self.shards.len()).chain(0..start) {
+            let shard = &self.shards[index];
+            match Arc::clone(&shard.sem).try_acquire_owned() {
+                Ok(count) => {
+                    // A shared byte shortage cannot be solved on another shard.
+                    // map drops count on either byte error, before async waiting.
+                    let permits = bytes
+                        .map(|sem| Arc::clone(sem).try_acquire_many_owned(charge))
+                        .transpose()
+                        .map(|bytes| ReadPermits {
+                            _count: count,
+                            _bytes: bytes,
+                        });
+                    return (shard, permits);
+                }
+                Err(TryAcquireError::NoPermits) => {
+                    waiting.get_or_insert(shard);
+                }
+                Err(TryAcquireError::Closed) => {}
+            }
+        }
+        // Closure racing with the scan is terminal, even if an earlier count
+        // attempt saw NoPermits. Later closure wakes the deferred acquire future.
+        if bytes.is_some_and(|sem| sem.is_closed()) {
+            return (first, Err(TryAcquireError::Closed));
+        }
+        match waiting {
+            Some(shard) => (shard, Err(TryAcquireError::NoPermits)),
+            None => (first, Err(TryAcquireError::Closed)),
+        }
+    }
+
     /// Pick the shard for the next op. Round-robin spreads the inline-completion
     /// memcpy across driver threads; correctness does not depend on the choice,
     /// because the handle remembers which shard took the op.
+    #[cfg(feature = "fault-injection")]
     fn shard(&self) -> &Shard {
         let n = self.shards.len();
         &self.shards[self.rr.fetch_add(1, Ordering::Relaxed) % n]
@@ -1074,14 +1154,13 @@ impl UringDriver {
         assert_eq!(id & CANCEL_BIT, 0, "op id overflowed into the cancel bit");
         let (done, rx) = oneshot::channel();
 
-        // Bind the op to one shard for its whole life: the permit, the message,
-        // the wake, and any later cancel all go to this ring. The handle holds
-        // clones of that shard's `tx`/`wake_efd`, so nothing can route a cancel
-        // to a ring whose pending table does not hold the op. The rejection paths
-        // below return an `Inert` handle that never sends, but still need a `tx`.
-        let shard = self.shard();
+        // Rejected requests retain the legacy round-robin cursor behavior.
+        // Valid capacity-aware reads choose their final owner after validation.
+        let start = self.rr.fetch_add(1, Ordering::Relaxed) % self.shards.len();
+        let shard = &self.shards[start];
+        let capacity_aware = self.shard_policy == ShardPolicy::CapacityAware && !allow_current_position;
         #[cfg(feature = "diagnostics")]
-        let timing = Trace::sample(&shard.stats.diagnostics);
+        let timing = (!capacity_aware).then(|| Trace::sample(&shard.stats.diagnostics)).flatten();
 
         // `CURRENT_POSITION` is an internal sentinel used only by
         // `read_current`; accepting it through a positioned API would silently
@@ -1208,11 +1287,26 @@ impl UringDriver {
         // fits u32, even on 32-bit Linux. Charge the exact Vec allocation length.
         let charge = allocation_bytes as u32;
 
+        #[cfg(feature = "diagnostics")]
+        let selection_started = capacity_aware.then(Instant::now);
+        let (shard, permits) = self.select_read_shard(start, charge, capacity_aware);
+        // Sample only the final owner, never the unsuccessful candidates. Default
+        // routing keeps its original sample sequence, including invalid requests.
+        #[cfg(feature = "diagnostics")]
+        let timing = match selection_started {
+            Some(started) if !matches!(&permits, Err(TryAcquireError::Closed)) => {
+                Trace::sample_since(&shard.stats.diagnostics, started)
+            }
+            Some(_) => None,
+            None => timing,
+        };
+
         // Take a backpressure permit BEFORE the op reaches the driver; it is
         // released only when the pending entry is dropped at the CQE (C10,
         // rustfs/backlog#1060). Acquisition never blocks the caller's thread
         // (rustfs/backlog#1102).
-        match try_read_permits(&shard.sem, self.byte_admission.as_ref().map(|admission| &admission.bytes), charge) {
+        // This owner is fixed for admission, message send, wake, and cancellation.
+        match permits {
             // Fast path: a permit was free, so submit eagerly — no allocation,
             // no await, and the op is in flight the moment `submit` returns,
             // exactly as with the previous blocking implementation.
