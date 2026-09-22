@@ -41,6 +41,7 @@ difference; they do not isolate syscall overhead or prove buffer-pool benefits.
 | `BENCH_WARMUP_OPS` | 0 | Concurrent benchmark operations before measurement |
 | `BENCH_WARMUP_RUNS` | 0 | Full streaming passes before measurement |
 | `BENCH_VERIFY` | Off | `1` or `true` enables byte-exact verification |
+| `BENCH_DIAGNOSTICS` | Off | `1` reports sampled driver-stage histograms to stderr; requires the `diagnostics` feature |
 | `SHARD_COUNTS` | 1 | Space-separated shard counts for the concurrent sweep |
 
 Ring depth is independent of concurrency so saturation can be exercised.
@@ -74,6 +75,54 @@ filesystems may still omit the direct assertions; a passing general test suite
 alone is not proof of O_DIRECT coverage.
 
 ## Performance acceptance
+
+### Sampled diagnostics
+
+Build with `--features diagnostics` to collect one sample per 64 handle
+constructions **per shard**, starting with each shard's first handle. Sampling
+has a separate sequence per shard so round-robin selection cannot bias every
+sample toward shard zero. Invalid requests can consume a sampling position
+without recording stages. Deterministic sampling is diagnostic, not an unbiased
+estimate for every possible periodic workload.
+
+`UringDriver::diagnostics()` aggregates shards;
+`UringDriver::shard_diagnostics()` preserves shard identity. Each stage has a
+count, total nanoseconds, and 64 log2 nanosecond buckets. Bucket zero covers
+0–1 ns; bucket i > 0 covers `[2^i, 2^(i+1))`. Counts and sums wrap modulo 2^64.
+Snapshots are approximate during concurrent updates; take quiescent snapshots
+and use `since()` on the same driver to exclude warmup without resetting it.
+
+| Stage | Boundary |
+| --- | --- |
+| `admission` | Handle timing starts to permit acquisition; includes an unpolled saturated handle's inactivity |
+| `driver_queue` | Immediately before send through driver intake |
+| `preparation` | Intake through initial local SQE backlog insertion |
+| `driver_lifetime` | Intake through final read CQE reap; includes preparation, retries and reaper delay |
+| `cqe_processing` | Each read CQE's handling and range adjustment, before removal/send |
+| `completion_to_poll` | Immediately before result send through caller ready poll, including receiver inactivity |
+
+These stages overlap; do not sum them or label lifetime as disk latency or
+completion-to-poll as Tokio schedule latency. Short reads can generate several
+CQE samples. Cancel CQEs themselves are excluded. Abandoned receivers do not
+create completion-to-poll samples. Rejection, driver disappearance, and the
+bounded-drain leak path can leave some stages unrecorded; do not infer a terminal
+CQE from an error delivered by shutdown.
+
+`BENCH_DIAGNOSTICS=1` makes the examples report **measurement-interval deltas**
+to stderr, outside their measured interval. Sweep scripts build with the feature
+automatically when this variable is 1. In a manually built binary the variable
+does not enable/disable instrumentation; it controls reporting only. CSV
+`diagnostics_interval` is 64 whenever the feature was compiled, otherwise zero,
+even on std strategies (which do not use the instrumented driver).
+
+The default build compiles out timing fields, clock reads, histogram storage and
+sample allocations. Enabled builds add a per-shard atomic sampling counter per
+handle and an Arc/timestamps/histogram updates for sampled operations. Measure
+that overhead on target hardware with separate feature-off/feature-on artifacts;
+do not assume it is free. Runtime schedule-latency and blocking-pool metrics must
+still be correlated in the application, which owns the Tokio runtime.
+
+### Target-hardware acceptance
 
 Use release builds and record source revisions, runtime configuration, filesystem,
 cache policy, resource allocation, and actual backend execution. Keep the total

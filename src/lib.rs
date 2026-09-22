@@ -48,5 +48,11 @@
 #[cfg(target_os = "linux")]
 mod driver;
 
+#[cfg(all(target_os = "linux", feature = "diagnostics"))]
+mod diagnostics;
+
+#[cfg(all(target_os = "linux", feature = "diagnostics"))]
+pub use diagnostics::{DIAGNOSTICS_SAMPLE_INTERVAL, DiagnosticsSnapshot, LatencyHistogram};
+
 #[cfg(target_os = "linux")]
 pub use driver::{ProbeFailure, ReadHandle, StatsSnapshot, UringDriver};

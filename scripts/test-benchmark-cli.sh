@@ -5,7 +5,9 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 if [[ "${BENCH_SKIP_BUILD:-0}" != 1 ]]; then
-    cargo build --locked --examples
+    build_features=()
+    if [[ "${BENCH_DIAGNOSTICS:-0}" == 1 ]]; then build_features=(--features diagnostics); fi
+    cargo build --locked --examples "${build_features[@]}"
 fi
 bin="${BENCH_BIN_DIR:-${CARGO_TARGET_DIR:-target}/debug/examples}"
 scratch=$(mktemp -d)
@@ -44,6 +46,23 @@ for strategy in std_buffered std_odirect uring_read_at uring_read_at_direct; do
         "$streaming" "$strategy" "$scratch/stream.bin" 1048583 65536 8 4096)
     check_row "$header" "$row" "$strategy"
 done
+
+if [[ "${BENCH_DIAGNOSTICS:-0}" == 1 ]]; then
+    # Warmup samples must be excluded. Each of two shards then sees 128 measured
+    # reads, giving four final-CQE samples in total rather than six.
+    BENCH_VERIFY=1 BENCH_WORKERS=2 BENCH_RING_ENTRIES=4 BENCH_WARMUP_OPS=128 \
+        "$concurrent" uring_cached_read "$scratch/random.bin" 1048576 4097 8 256 2 \
+        >/dev/null 2>"$scratch/diagnostics.log"
+    awk '
+        /^DIAGNOSTICS / {
+            split($2, stage, "="); split($4, count, "=")
+            if (stage[2] == "cqe_processing") { if (count[2] < 4) exit 1 }
+            else if (count[2] != 4) exit 1
+            seen++
+        }
+        END { if (seen != 6) exit 1 }
+    ' "$scratch/diagnostics.log"
+fi
 
 if BENCH_RING_ENTRIES=3 "$concurrent" std_cached_pread "$scratch/random.bin" 1048576 4096 1 1; then
     echo "non-power-of-two ring depth was accepted" >&2

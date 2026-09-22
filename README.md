@@ -78,6 +78,11 @@ The public API is intentionally small and read-only:
 `submitted == delivered + orphan_reclaimed` holds after all completions have
 been reaped; `in_flight == 0` indicates a clean shutdown.
 
+The optional `diagnostics` feature exposes sampled stage histograms through
+`UringDriver::diagnostics()` and `shard_diagnostics()`. It is off by default.
+See [the measurement guide](docs/benchmarking.md#sampled-diagnostics) for sampling,
+stage overlap, cancellation, and instrumentation-overhead boundaries.
+
 ## Testing
 
 Benchmark configuration, CSV schema, timing boundaries, and performance gates

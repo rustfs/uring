@@ -23,6 +23,22 @@ aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Opt-in `diagnostics` feature with per-shard sampled driver-stage histograms,
+  aggregate snapshots, and measurement-interval deltas. Default builds compile
+  out the timing fields and sampling work.
+- Native O_DIRECT execution gate and byte-exact benchmark CLI smoke coverage.
+
+### Changed
+
+- Benchmark CSV schema v2 obtains headers from the executable and reports
+  independent setup, workload, and teardown timings, configurable ring depth,
+  workers, warmup, and instrumentation status. Positional CSV consumers must
+  migrate to the new header.
+- Clarified that driver submission counters count accepted logical reads and
+  delivery counters count successful channel sends, not caller consumption.
+
 ## [0.2.2] - 2026-09-07
 
 This patch release documents and hardens the public read API while preserving

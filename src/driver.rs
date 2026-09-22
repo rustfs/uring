@@ -28,6 +28,9 @@ use std::time::{Duration, Instant};
 
 use io_uring::{IoUring, opcode, types};
 
+#[cfg(feature = "diagnostics")]
+use crate::diagnostics::{Diagnostics, DiagnosticsSnapshot, Trace};
+
 /// Upper bound on how long shutdown waits for in-flight ops to drain before
 /// leaking the ring+buffers and exiting (C4, rustfs/backlog#1055). ASYNC_CANCEL
 /// cannot interrupt an in-execution regular-file read on a D-state/NFS-hung
@@ -273,6 +276,8 @@ type AcquireFut = Pin<Box<dyn Future<Output = Result<OwnedSemaphorePermit, tokio
 
 #[derive(Default)]
 struct DriverStats {
+    #[cfg(feature = "diagnostics")]
+    diagnostics: Arc<Diagnostics>,
     submitted: AtomicU64,
     delivered: AtomicU64,
     orphan_reclaimed: AtomicU64,
@@ -287,15 +292,17 @@ struct DriverStats {
 /// Point-in-time copy of the driver counters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct StatsSnapshot {
-    /// Read ops handed to the kernel.
+    /// Logical reads accepted into the pending table, before kernel submission.
+    /// Short-read resubmissions do not increment this count.
     pub submitted: u64,
-    /// CQEs whose result was received by a live caller.
+    /// Logical results successfully sent to the caller's channel. This does not
+    /// prove the caller has polled or consumed the result.
     pub delivered: u64,
     /// CQEs whose caller had dropped the future: the buffer stayed in the
     /// pending table the whole time and was reclaimed here, at the CQE.
     pub orphan_reclaimed: u64,
-    /// Ops submitted but not yet completed. The kernel may still write into
-    /// their buffers.
+    /// Logical reads in the pending table, including queued reads not yet
+    /// submitted. The kernel may still write into submitted reads' buffers.
     pub in_flight: u64,
     /// ASYNC_CANCEL CQEs that reported the target op was canceled (res == 0).
     pub cancel_succeeded: u64,
@@ -325,6 +332,8 @@ pub struct StatsSnapshot {
 enum Msg {
     Read {
         id: u64,
+        #[cfg(feature = "diagnostics")]
+        timing: Option<Arc<Trace>>,
         file: Arc<File>,
         offset: u64,
         len: usize,
@@ -382,6 +391,8 @@ enum Msg {
 ///   only `buf[pad + head .. pad + head + want]` — alignment padding never
 ///   escapes.
 struct Pending {
+    #[cfg(feature = "diagnostics")]
+    timing: Option<Arc<Trace>>,
     buf: Vec<u8>,
     file: Arc<File>,
     done: Option<oneshot::Sender<io::Result<Vec<u8>>>>,
@@ -473,6 +484,8 @@ enum HandleState {
 #[must_use = "a read handle must be awaited or explicitly dropped"]
 pub struct ReadHandle {
     id: u64,
+    #[cfg(feature = "diagnostics")]
+    timing: Option<Arc<Trace>>,
     rx: oneshot::Receiver<io::Result<Vec<u8>>>,
     tx: mpsc::Sender<Msg>,
     finished: bool,
@@ -538,10 +551,16 @@ impl Future for ReadHandle {
             else {
                 unreachable!("state was WaitingPermit")
             };
+            #[cfg(feature = "diagnostics")]
+            if let Some(timing) = &this.timing {
+                timing.enqueue();
+            }
             if this
                 .tx
                 .send(Msg::Read {
                     id: this.id,
+                    #[cfg(feature = "diagnostics")]
+                    timing: this.timing.clone(),
                     file,
                     offset,
                     len,
@@ -561,6 +580,12 @@ impl Future for ReadHandle {
 
         match Pin::new(&mut this.rx).poll(cx) {
             Poll::Ready(res) => {
+                #[cfg(feature = "diagnostics")]
+                if !this.finished
+                    && let Some(timing) = &this.timing
+                {
+                    timing.received();
+                }
                 this.finished = true;
                 Poll::Ready(match res {
                     Ok(inner) => inner,
@@ -828,6 +853,8 @@ impl UringDriver {
         // to a ring whose pending table does not hold the op. The rejection paths
         // below return an `Inert` handle that never sends, but still need a `tx`.
         let shard = self.shard();
+        #[cfg(feature = "diagnostics")]
+        let timing = Trace::sample(&shard.stats.diagnostics);
 
         // `CURRENT_POSITION` is an internal sentinel used only by
         // `read_current`; accepting it through a positioned API would silently
@@ -840,6 +867,8 @@ impl UringDriver {
             )));
             return ReadHandle {
                 id,
+                #[cfg(feature = "diagnostics")]
+                timing,
                 rx,
                 tx: shard.tx.clone(),
                 finished: false,
@@ -862,6 +891,8 @@ impl UringDriver {
             )));
             return ReadHandle {
                 id,
+                #[cfg(feature = "diagnostics")]
+                timing,
                 rx,
                 tx: shard.tx.clone(),
                 finished: false,
@@ -883,6 +914,8 @@ impl UringDriver {
             )));
             return ReadHandle {
                 id,
+                #[cfg(feature = "diagnostics")]
+                timing,
                 rx,
                 tx: shard.tx.clone(),
                 finished: false,
@@ -917,6 +950,8 @@ impl UringDriver {
                 )));
                 return ReadHandle {
                     id,
+                    #[cfg(feature = "diagnostics")]
+                    timing,
                     rx,
                     tx: shard.tx.clone(),
                     finished: false,
@@ -935,8 +970,14 @@ impl UringDriver {
             // no await, and the op is in flight the moment `submit` returns,
             // exactly as with the previous blocking implementation.
             Ok(permit) => {
+                #[cfg(feature = "diagnostics")]
+                if let Some(timing) = &timing {
+                    timing.enqueue();
+                }
                 if let Err(mpsc::SendError(msg)) = shard.tx.send(Msg::Read {
                     id,
+                    #[cfg(feature = "diagnostics")]
+                    timing: timing.clone(),
                     file,
                     offset,
                     len,
@@ -954,6 +995,8 @@ impl UringDriver {
                     }
                     return ReadHandle {
                         id,
+                        #[cfg(feature = "diagnostics")]
+                        timing,
                         rx,
                         tx: shard.tx.clone(),
                         finished: false,
@@ -965,6 +1008,8 @@ impl UringDriver {
                 shard.wake_efd.signal();
                 ReadHandle {
                     id,
+                    #[cfg(feature = "diagnostics")]
+                    timing,
                     rx,
                     tx: shard.tx.clone(),
                     finished: false,
@@ -979,6 +1024,8 @@ impl UringDriver {
             // handle, which awaits it on its first poll and submits then.
             Err(TryAcquireError::NoPermits) => ReadHandle {
                 id,
+                #[cfg(feature = "diagnostics")]
+                timing,
                 rx,
                 tx: shard.tx.clone(),
                 finished: false,
@@ -998,6 +1045,8 @@ impl UringDriver {
                 let _ = done.send(Err(io::Error::other("uring driver shut down")));
                 ReadHandle {
                     id,
+                    #[cfg(feature = "diagnostics")]
+                    timing,
                     rx,
                     tx: shard.tx.clone(),
                     finished: false,
@@ -1027,6 +1076,25 @@ impl UringDriver {
             snap.submit_errors += s.submit_errors.load(Ordering::SeqCst);
         }
         snap
+    }
+
+    /// Sampled stage histograms aggregated across shards. Available only with
+    /// the opt-in `diagnostics` feature; the default driver has no timing fields.
+    /// See [`DiagnosticsSnapshot`] for stage boundaries and snapshot consistency.
+    #[cfg(feature = "diagnostics")]
+    pub fn diagnostics(&self) -> DiagnosticsSnapshot {
+        let mut snapshot = DiagnosticsSnapshot::default();
+        for shard in &self.shards {
+            snapshot.merge(&shard.stats.diagnostics.snapshot());
+        }
+        snapshot
+    }
+
+    /// Per-shard sampled histograms in stable shard-index order. Snapshot reads
+    /// allocate only this output vector and do not acquire driver-thread locks.
+    #[cfg(feature = "diagnostics")]
+    pub fn shard_diagnostics(&self) -> Vec<DiagnosticsSnapshot> {
+        self.shards.iter().map(|shard| shard.stats.diagnostics.snapshot()).collect()
     }
 
     /// Test-only fault injection (rustfs/backlog#1103): poison one driver thread
@@ -1470,6 +1538,8 @@ fn drive(
             match msg {
                 Msg::Read {
                     id,
+                    #[cfg(feature = "diagnostics")]
+                    timing,
                     file,
                     offset,
                     len,
@@ -1483,6 +1553,10 @@ fn drive(
                         // returns it immediately.
                         drop(permit);
                         continue;
+                    }
+                    #[cfg(feature = "diagnostics")]
+                    if let Some(timing) = &timing {
+                        timing.enter();
                     }
                     // `submit` already validated this geometry.
                     let (kernel_offset, head, region_len) =
@@ -1523,6 +1597,8 @@ fn drive(
                     state.pending.insert(
                         id,
                         Pending {
+                            #[cfg(feature = "diagnostics")]
+                            timing,
                             buf,
                             file,
                             done: Some(done),
@@ -1543,6 +1619,10 @@ fn drive(
                     stats.submitted.fetch_add(1, Ordering::SeqCst);
                     stats.in_flight.fetch_add(1, Ordering::SeqCst);
                     state.backlog.push_back(sqe);
+                    #[cfg(feature = "diagnostics")]
+                    if let Some(timing) = state.pending.get(&id).and_then(|p| p.timing.as_ref()) {
+                        timing.prepared();
+                    }
                 }
                 Msg::Cancel { id } => {
                     if state.pending.contains_key(&id) {
@@ -1613,6 +1693,12 @@ fn drive(
             if !state.pending.contains_key(&ud) {
                 continue;
             }
+            #[cfg(feature = "diagnostics")]
+            let timing = state
+                .pending
+                .get(&ud)
+                .and_then(|p| p.timing.as_ref())
+                .map(|trace| (Arc::clone(trace), trace.now()));
 
             // Decide the next step while borrowing the entry, then act after
             // the borrow ends (finish removes it; resubmit re-queues an SQE).
@@ -1689,6 +1775,10 @@ fn drive(
                 }
             };
 
+            #[cfg(feature = "diagnostics")]
+            if let Some((timing, started)) = &timing {
+                timing.reaped(*started, matches!(&step, ReapStep::Finish(_)));
+            }
             match step {
                 ReapStep::Finish(outcome) => {
                     // Content hygiene (C12, rustfs/backlog#1062): the delivered
@@ -1697,6 +1787,10 @@ fn drive(
                     // across requests, this ⊆ [0, res) property MUST be
                     // preserved or a previous tenant's object bytes leak.
                     let mut p = state.pending.remove(&ud).expect("checked above");
+                    #[cfg(feature = "diagnostics")]
+                    if let Some(timing) = &p.timing {
+                        timing.sending();
+                    }
                     match p.done.take().expect("done sender set at submit").send(outcome) {
                         Ok(()) => stats.delivered.fetch_add(1, Ordering::SeqCst),
                         // Caller dropped the future: the buffer survived in

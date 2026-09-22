@@ -64,6 +64,10 @@ jobs:
           grep -q "DIRECT_OK direct_read_returns_exact_unaligned_ranges" test.out
       - name: Benchmark schema and correctness smoke
         run: bash scripts/test-benchmark-cli.sh
+      - name: Instrumented benchmark schema and correctness smoke
+        env:
+          BENCH_DIAGNOSTICS: "1"
+        run: bash scripts/test-benchmark-cli.sh
 
   docker-two-legs:
     name: docker (degradation + real io_uring)
