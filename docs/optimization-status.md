@@ -7,13 +7,13 @@ integration are separate gates; a checked code item does not close the roadmap.
 | Step | Implementation and review | Remaining acceptance |
 | --- | --- | --- |
 | 1.1–1.4: benchmark schema, timing, diagnostics, direct positive gate | Merged in [#15](https://github.com/rustfs/uring/pull/15), CI passed | Diagnostics overhead and real LocalIoBackend baseline |
-| 1.5: ABBA evidence tooling | Implemented; 10 gate/cleanup tests pass | Stable calibration, valid comparison and application integration |
-| 2.1–2.4: completion recovery, direct integrity, byte admission, guarantee boundaries | Implemented and independently reviewed; native regression suite passed | Hardening PR CI/merge; application-wide limits remain separate |
-| 3.1–3.3: bounded turns, explicit batch notifications, cancellation efficiency | Implemented and independently reviewed; native regression suite passed | CPU/syscall and tail-latency comparison; PR CI/merge |
-| 4.1: capacity-aware routing | Implemented and independently reviewed, opt-in; native tests passed | Controlled slow-shard/mixed-load performance; PR CI/merge |
-| 4.2: system-wide budgets and probe offload | Not implemented in this crate | Fresh application-path review and coordinated integration |
+| 1.5: ABBA evidence tooling | Explicit same-binary calibration implemented/reviewed; 20 gate/cleanup tests pass | Stable native calibration, valid comparison and application integration |
+| 2.1–2.4: completion recovery, direct integrity, byte admission, guarantee boundaries | Implemented and independently reviewed; native regression suite passed | PR merge; application-wide limits remain separate |
+| 3.1–3.3: bounded turns, explicit batch notifications, cancellation efficiency | Implemented and independently reviewed; native regression suite passed | CPU/syscall and tail-latency comparison; PR merge |
+| 4.1: capacity-aware routing | Implemented and independently reviewed, opt-in; native tests passed | Controlled slow-shard/mixed-load performance; PR merge |
+| 4.2: system-wide budgets and probe offload | Current application main audited; integration not implemented | [Application dependency, fallback and cross-disk budget wiring](rustfs-integration.md) |
 | 5: owned buffers and direct FD cache | Not implemented | Profile evidence, lease/pool lifetime design and cache invalidation integration |
-| 6: ordered streaming prefetch | Not implemented | Consumer/backpressure contract and end-to-end evidence |
+| 6: ordered streaming prefetch | [Example-only contract experiment](ordered-prefetch.md) implemented/reviewed; 11 portable tests pass | Native example gate, production consumer contract, bitrot/S3 and performance evidence |
 | 7: advanced ring/runtime modes | Not enabled or implemented | Earlier gates, capability/fallback and isolated benefit evidence |
 
 ## Correctness and review evidence
@@ -27,6 +27,35 @@ native suite passed another 90 tests with no skips and the same direct marker.
 A Linux-target
 default/all-feature Clippy check and warning-denying rustdoc passed locally;
 cross-compilation is not additional native execution evidence.
+
+The following documentation head `80a7af9` passed all three jobs in
+[CI #53](https://github.com/rustfs/uring/actions/runs/35767797346), including
+restricted/unrestricted Docker tests and both benchmark smoke modes. Later
+follow-up commits need their own CI; the live PR and tracking issue record
+final-head CI and merge status separately.
+
+## Follow-up evidence and examples
+
+`6927bb0` adds explicit same-binary calibration: identical executable content,
+zero diagnostics interval on every leg, unchanged endpoint drift thresholds,
+and a separate drift check for each middle leg against the endpoint mean.
+Calibration never emits candidate-attribution fields; 20 Python tests pass,
+including synthetic three-round execution and early-stop cases. These tests do
+not establish a stable native calibration.
+
+`f135f1d` adds an example-local ordered reader, not a public streaming API.
+Eleven portable tests pass, including actual Tokio semaphore reservation order,
+cancelled `next`, EOF/error ordering, logical-byte accounting and slow-consumer
+boundaries. The CLI uses an immutable fixture and positioned std oracle outside
+the executor; the new CI smoke requires successful native io_uring byte checks
+and bounds each child process duration. No production driver code or default
+behavior changes in these follow-ups.
+
+Both additions and the current-main application integration plan received
+independent review. Dedicated-host native execution is deferred while an existing
+CI worker is active; the worker was not stopped and no performance run was made.
+Portable checks and Linux-target compilation are not substitutes for the new
+native CLI gate. Final-head CI/execution results are tracked in the issue/PR.
 
 Independent reviews covered buffer/FD/permit ownership, global closure and
 count-stage waiters, cancellation races, final-owner routing, batch unwind and
@@ -62,3 +91,5 @@ establish stable calibration without loosening gates after observing results.
 - [Driver turn fairness](driver-fairness.md)
 - [Explicit buffered batches](batch-reads.md)
 - [Measurement boundaries and evidence gates](benchmarking.md)
+- [Current RustFS application integration prerequisites](rustfs-integration.md)
+- [Ordered-prefetch contract experiment](ordered-prefetch.md)
