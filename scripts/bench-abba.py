@@ -66,7 +66,7 @@ def percent_change(after, before):
     return result
 
 
-def evaluate_round(rows, throughput_drift, tail_drift):
+def evaluate_round(rows, throughput_drift, tail_drift, *, calibration=False):
     if [row["leg"] for row in rows] != ["A1", "B1", "B2", "A2"]:
         raise ValueError("incomplete or reordered ABBA round")
     a1, b1, b2, a2 = [row["measurement"] for row in rows]
@@ -76,6 +76,23 @@ def evaluate_round(rows, throughput_drift, tail_drift):
     }
     valid = abs(drift["iops_pct"]) <= throughput_drift and abs(drift["p99_pct"]) <= tail_drift
     result = {"valid": valid, "baseline_drift": drift}
+    if calibration:
+        # Each middle leg must be stable on its own: averaging B1/B2 first
+        # could cancel opposite noise and incorrectly certify calibration.
+        middle = {
+            leg: {
+                "iops_pct": percent_change(row["IOPS"], (a1["IOPS"] + a2["IOPS"]) / 2),
+                "p99_pct": percent_change(row["p99_us"], (a1["p99_us"] + a2["p99_us"]) / 2),
+            }
+            for leg, row in (("B1", b1), ("B2", b2))
+        }
+        result["middle_drift"] = middle
+        result["valid"] = valid and all(
+            abs(drift["iops_pct"]) <= throughput_drift and abs(drift["p99_pct"]) <= tail_drift
+            for drift in middle.values()
+        )
+        # A/A noise is never a candidate benefit, even when all gates pass.
+        return result
     # Do not calculate candidate attribution after a failed baseline gate.
     if valid:
         result["candidate_change_pct"] = {
@@ -166,8 +183,10 @@ def arguments():
     parser.add_argument("--ops", type=int, default=1_000_000)
     parser.add_argument("--warmup-ops", type=int, default=10000)
     parser.add_argument("--rounds", type=int, default=3)
+    parser.add_argument("--calibration", action="store_true",
+                        help="same-binary A/A calibration; also gate each middle leg; requires --candidate-interval 0")
     parser.add_argument("--candidate-interval", type=int, choices=(0, 64), default=64,
-                        help="0 supports A/A calibration; 64 compares diagnostics on against off")
+                        help="0 compares feature-off artifacts; 64 compares diagnostics on against off (default)")
     parser.add_argument("--throughput-drift-pct", type=float, default=3)
     parser.add_argument("--p99-drift-pct", type=float, default=5)
     parser.add_argument("--timeout", type=float, default=300)
@@ -175,6 +194,8 @@ def arguments():
     parser.add_argument("--min-seconds", type=float, default=5)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
+    if args.calibration and args.candidate_interval != 0:
+        parser.error("calibration requires --candidate-interval 0 so every leg has the same diagnostics configuration")
     if not (100000 <= args.ops <= 10_000_000) or args.rounds < 3:
         parser.error("acceptance requires 100000..10000000 operations and at least three rounds")
     if any(not math.isfinite(value) or value < 0 for value in (
@@ -196,7 +217,11 @@ def arguments():
 
 def main():
     args = arguments()
+    mode = "calibration" if args.calibration else "comparison"
     binaries = {"A": args.baseline.resolve(), "B": args.candidate.resolve()}
+    identities = {key: {"path": str(path), "sha256": sha256(path)} for key, path in binaries.items()}
+    if args.calibration and identities["A"]["sha256"] != identities["B"]["sha256"]:
+        raise ValueError("calibration requires the same binary content for baseline and candidate")
     headers = {key: subprocess.check_output([str(path), "--header"], text=True).strip() for key, path in binaries.items()}
     if headers["A"] != headers["B"]:
         raise ValueError("baseline and candidate schema differ")
@@ -205,18 +230,18 @@ def main():
                     ring_entries=args.entries, warmup_ops=args.warmup_ops)
     plan = [(round_id, leg) for round_id in range(1, args.rounds + 1) for leg in ("A1", "B1", "B2", "A2")]
     if args.dry_run:
-        print(json.dumps({"plan": plan, "geometry": expected, "candidate_interval": args.candidate_interval}))
+        print(json.dumps({"mode": mode, "plan": plan, "geometry": expected, "candidate_interval": args.candidate_interval}))
         return 0
     environment_guard(args.require_inactive_unit)
     args.run_dir.mkdir(mode=0o700)
-    provenance = {"source_revision": args.source_revision, "reservation": args.reservation_note,
+    provenance = {"mode": mode, "source_revision": args.source_revision, "reservation": args.reservation_note,
                   "cache": "warm-preload", "geometry": expected, "cpus": args.cpus,
                   "data_identity": data_identity(args.data_file),
-                  "binaries": {key: {"path": str(path), "sha256": sha256(path)} for key, path in binaries.items()},
+                  "binaries": identities,
                   "gates": {"throughput_drift_pct": args.throughput_drift_pct, "p99_drift_pct": args.p99_drift_pct,
                             "min_seconds": args.min_seconds}, "candidate_interval": args.candidate_interval}
     (args.run_dir / "provenance.json").write_text(json.dumps(provenance, indent=2) + "\n")
-    summary = {"status": "incomplete", "rounds": []}
+    summary = {"mode": mode, "status": "incomplete", "rounds": []}
     try:
         current_round = []
         for round_id, leg in plan:
@@ -254,12 +279,14 @@ def main():
             current_round.append(record)
             print(f"round={round_id} leg={leg} IOPS={row['IOPS']:.0f} p99_us={row['p99_us']:.0f}", flush=True)
             if leg == "A2":
-                result = evaluate_round(current_round, args.throughput_drift_pct, args.p99_drift_pct)
+                result = evaluate_round(current_round, args.throughput_drift_pct, args.p99_drift_pct,
+                                        calibration=args.calibration)
                 summary["rounds"].append(result)
                 current_round = []
                 if not result["valid"]:
-                    raise RuntimeError("baseline drift failed; stopped before expanding the experiment")
-        summary["status"] = "valid-comparison"
+                    gate = "calibration drift" if args.calibration else "baseline drift"
+                    raise RuntimeError(f"{gate} failed; stopped before expanding the experiment")
+        summary["status"] = "valid-calibration" if args.calibration else "valid-comparison"
         summary["scope"] = "driver-only; resource CSV is whole-process CPU/RSS, not steady-state-only"
         return 0
     except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as error:

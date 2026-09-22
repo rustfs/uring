@@ -171,9 +171,40 @@ service can introduce load, supply `--require-inactive-unit UNIT`; the runner
 refuses to start or continue unless that unit is inactive. Any service stop or
 restore is an explicit operator action outside this tool. A reservation note and
 process checks are evidence aids, not a substitute for exclusive resources.
-Perform A/A calibration first by passing the baseline binary in both positions
-and `--candidate-interval 0`; then use the diagnostics candidate and the default
-interval of 64. Keep the workload and thresholds fixed between experiments.
+Perform explicit A/A calibration first with `--calibration --candidate-interval 0`
+and the same feature-off binary in both positions; then use the diagnostics
+candidate without `--calibration` and with the default interval of 64. Keep the
+workload and thresholds fixed between experiments.
+
+For example, use the preceding command with both executable arguments pointing
+to the baseline artifact and add:
+
+```sh
+--calibration --candidate-interval 0
+```
+
+Calibration requires matching executable SHA-256 values before running either
+artifact (identical copies at different paths are allowed), and requires interval
+zero for every measurement row. A mismatched hash or nonzero candidate interval
+is rejected, including in `--dry-run`. Each leg retains the normal binary-identity,
+geometry, resource and duration checks. Dry-run, provenance and summary output
+identify `mode` as `calibration` or `comparison`; dry-run does not execute workloads
+or establish that runtime gates will pass.
+
+Calibration preserves at least three A1/B1/B2/A2 rounds and the existing default
+thresholds: 3% for IOPS and 5% for p99. Every round checks A2 against A1, then checks
+**B1 and B2 separately** against the arithmetic mean of A1/A2, using those same
+thresholds in either direction. It never averages B1/B2 before gating: opposite
+noise must not cancel out. The first failed round stops the experiment. Only
+after all requested rounds pass does the summary say `valid-calibration`.
+Calibration records `baseline_drift` and per-leg `middle_drift`, never
+`candidate_change_pct`, whether it succeeds or fails. This validates the specified
+within-round noise gates, not an optimization benefit or stability under another
+workload. Cross-round trends, resources and application SLOs still require review.
+
+Omitting `--calibration` retains comparison mode and its original endpoint drift
+gate. Passing the same binary with `--candidate-interval 0` alone does not enable
+the additional middle-leg gates and must not be reported as validated calibration.
 
 Every leg must run at least five measured seconds by default. If it is too
 short, increase operations in a **new** experiment. The tool validates geometry,
@@ -190,5 +221,9 @@ and resource reports against the application SLO separately. Duration histograms
 with too few sampled operations are not reliable tail estimates.
 
 Runner gate tests: `python3 -m unittest discover -s scripts -p 'test_bench_abba.py'`.
+Calibration regressions use synthetic CSV/resource reports and mocked workload
+execution to cover mode validation, matching hashes, endpoint and middle drift,
+opposite-noise rejection, three-round success and early failure. They verify the
+runner's decisions, not native Linux performance or isolation.
 
 Tracking and implementation status: [rustfs/backlog#2647](https://github.com/rustfs/backlog/issues/2647).
