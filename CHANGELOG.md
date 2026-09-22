@@ -25,6 +25,9 @@ aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Opt-in `SharedReadBudget` whole-driver quota reservations, retained through
+  deferred and kernel-owned reads, including bounded-drain leaks. Independent
+  drivers keep independent admission and shutdown; default constructors are unchanged.
 - Non-joining `request_shutdown`, advisory `is_finished`, and a default-off
   `tokio-runtime` feature for eager consuming `shutdown_async` ownership handoff.
   Synchronous `shutdown`/`Drop` and bounded-drain leak guarantees remain explicit.

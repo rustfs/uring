@@ -47,6 +47,12 @@ Relevant paths: [backend lifecycle](https://github.com/rustfs/rustfs/blob/1880b4
    Current `ReadLimits` covers one driver only: use conservatively allocated
    per-driver quotas or design an explicitly shared application admission layer.
    The existing best-effort per-ring io-wq setting is not a process thread cap.
+   The library's [shared reservation pool](shared-read-budget.md) offers the
+   conservative whole-driver quota option: pass the same pool across reconnects
+   and generations; leaked pending reads keep the entire reservation. It does
+   not wire the application's dependency, std fallback, result assembly, or
+   retained results into any budget. A temporary `WouldBlock` reservation error
+   must not enter the permanent unsupported-disk cache.
 3. **Fix invalidation before adding direct cache hits.**
    [Exact invalidation](https://github.com/rustfs/rustfs/blob/1880b42169bf26b15d8ca6bea3d8f1e4203b1bad/crates/ecstore/src/disk/local.rs#L3991)
    currently builds a buffered-only key; invalidate both variants before

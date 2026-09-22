@@ -13,6 +13,7 @@ integration are separate gates; a checked code item does not close the roadmap.
 | 3.1–3.3: bounded turns, explicit batch notifications, cancellation efficiency | Implemented and independently reviewed; native regression suite passed | CPU/syscall and tail-latency comparison; PR merge |
 | 4.1: capacity-aware routing | Implemented and independently reviewed, opt-in; native tests passed | Controlled slow-shard/mixed-load performance; PR merge |
 | 4.2: system-wide budgets and probe offload | Application probe offload, driver-thread budget and logical chunk limit implemented/reviewed in draft PRs #8072/#8074/#8076 | Full CI/merge; physical byte/result/io-wq budgets and [dependency wiring](rustfs-integration.md) remain open |
+| 4.2 pool prerequisite | Library whole-driver shared quota implemented; two independent reviews and local compilation checks pass | Native CI, application dependency/fallback/result ownership wiring and merge |
 | 5: owned buffers and direct FD cache | Dual-mode exact invalidation implemented/reviewed in application draft PR #8075; direct caching and owned buffers not enabled | Full CI/merge, profile evidence, lease/pool lifetime and complete invalidation integration |
 | 6: ordered streaming prefetch | [Example-only contract experiment](ordered-prefetch.md) implemented/reviewed; 11 portable tests and native CLI CI #54 passed | Production consumer contract, bitrot/S3 and performance evidence |
 | 7: advanced ring/runtime modes | Not enabled or implemented | Earlier gates, capability/fallback and isolated benefit evidence |
@@ -36,6 +37,19 @@ follow-up commits need their own CI; the live PR and tracking issue record
 final-head CI and merge status separately.
 
 ## Follow-up evidence and examples
+
+`3931124` implements `SharedReadBudget` whole-driver reservations, with public
+tests in `7e94f36`. Seven deterministic private tests and nine public/native
+tests cover concurrent accounting, large `usize` quotas, message/deferred
+ownership, independent shutdown, retained results and leaked whole quotas.
+Two independent code/test/document reviews found no blocking issue. Local
+Linux-target default/all-feature all-target checks, all-feature Clippy,
+default/all-feature warning-denying rustdoc, formatting and diff checks pass;
+the default library/dependency graph remains Tokio sync-only. The initial RED
+was missing-API compilation, not a behavioral run. Native execution for this
+addition is pending. Its [contract](shared-read-budget.md) documents the
+later-shard startup-failure coverage boundary and conservative idle/retirement
+reservation costs. Application wiring and performance remain separate gates.
 
 Application work is tracked in [RustFS #8072](https://github.com/rustfs/rustfs/pull/8072),
 [#8074](https://github.com/rustfs/rustfs/pull/8074),
@@ -115,6 +129,7 @@ establish stable calibration without loosening gates after observing results.
 
 - [Public read and admission contracts](../README.md)
 - [Shutdown ownership and Tokio adapter](shutdown.md)
+- [Shared whole-driver read-budget reservations](shared-read-budget.md)
 - [Completion recovery and direct integrity](fault-recovery.md)
 - [Cancellation and eventfd behavior](cancellation-efficiency.md)
 - [Driver turn fairness](driver-fairness.md)
