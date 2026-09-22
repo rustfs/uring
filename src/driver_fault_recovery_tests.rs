@@ -3,6 +3,38 @@
 
 use super::*;
 
+#[test]
+fn unchanged_cumulative_overflow_warns_only_once() {
+    let stats = DriverStats::default();
+    let mut previous = 0;
+    assert!(!update_cq_overflow(&stats, &mut previous, 0));
+    assert!(update_cq_overflow(&stats, &mut previous, 7));
+    assert!(!update_cq_overflow(&stats, &mut previous, 7));
+    assert_eq!(stats.cq_overflow.load(Ordering::SeqCst), 7);
+    assert!(update_cq_overflow(&stats, &mut previous, 8));
+    assert_eq!(stats.cq_overflow.load(Ordering::SeqCst), 8);
+}
+
+#[test]
+fn overflow_counter_wrap_to_zero_updates_snapshot_and_rearms_warning() {
+    let stats = DriverStats::default();
+    let mut previous = 0;
+    assert!(update_cq_overflow(&stats, &mut previous, u32::MAX));
+    assert!(!update_cq_overflow(&stats, &mut previous, 0));
+    assert_eq!(stats.cq_overflow.load(Ordering::SeqCst), 0);
+    assert!(update_cq_overflow(&stats, &mut previous, 1));
+    assert!(!update_cq_overflow(&stats, &mut previous, 1));
+}
+
+#[test]
+fn overflow_counter_wrap_to_nonzero_warns_for_new_observation() {
+    let stats = DriverStats::default();
+    let mut previous = 0;
+    assert!(update_cq_overflow(&stats, &mut previous, u32::MAX));
+    assert!(update_cq_overflow(&stats, &mut previous, 2));
+    assert_eq!(stats.cq_overflow.load(Ordering::SeqCst), 2);
+}
+
 fn direct_prefix() -> (Pending, oneshot::Receiver<io::Result<Vec<u8>>>) {
     let (done, receiver) = oneshot::channel();
     let pending = Pending {
