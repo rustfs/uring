@@ -137,4 +137,49 @@ with that sample count. Increase the population and report uncertainty. Closed
 loop concurrency also hides overload queueing; evaluate a controlled arrival
 rate separately when studying tail latency.
 
+### ABBA driver runner
+
+`scripts/bench-abba.py` (Python 3.11+, Linux, GNU time, taskset) runs three or
+more A1/B1/B2/A2 rounds against a **pre-created, byte-verified** warm-cache
+dataset. Build two release artifacts from the same source with diagnostics off
+and on, using separate target directories. Supply explicit binaries, source
+revision, CPU affinity, and a reservation description. The tool never stops
+services, changes their configuration, clears global caches, or overwrites an
+existing result directory.
+
+```sh
+python3 scripts/bench-abba.py \
+  --baseline /test/target-off/release/examples/concurrent_pread_bench \
+  --candidate /test/target-on/release/examples/concurrent_pread_bench \
+  --data-file /test/verified-data.bin --run-dir /test/results/new-run \
+  --source-revision COMMIT --reservation-note 'reserved benchmark window' \
+  --cpus 0-7 --workers 4 --shards 2 --entries 64 \
+  --ops 1000000 --warmup-ops 10000 --rounds 3 --dry-run
+```
+
+Remove `--dry-run` only after reserving resources. If a CI runner or another
+service can introduce load, supply `--require-inactive-unit UNIT`; the runner
+refuses to start or continue unless that unit is inactive. Any service stop or
+restore is an explicit operator action outside this tool. A reservation note and
+process checks are evidence aids, not a substitute for exclusive resources.
+Perform A/A calibration first by passing the baseline binary in both positions
+and `--candidate-interval 0`; then use the diagnostics candidate and the default
+interval of 64. Keep the workload and thresholds fixed between experiments.
+
+Every leg must run at least five measured seconds by default. If it is too
+short, increase operations in a **new** experiment. The tool validates geometry,
+feature state, sample count, schema, finite values, derived throughput, process
+resource reports, binary identity and dataset metadata. Active build/load/CI
+workers, errors, per-leg deadlines, or failed baseline drift invalidate the run.
+It stops after the first invalid round rather than expanding the matrix.
+
+Output contains provenance, each leg's CSV/stderr and whole-process CPU/RSS/
+context-switch report, parsed leg JSON, and a summary. `valid-comparison` means
+the evidence passed these gates, **not** that the candidate improved, passed an
+overhead budget, or proved a RustFS/S3 benefit. Review signed candidate changes
+and resource reports against the application SLO separately. Duration histograms
+with too few sampled operations are not reliable tail estimates.
+
+Runner gate tests: `python3 -m unittest discover -s scripts -p 'test_bench_abba.py'`.
+
 Tracking and implementation status: [rustfs/backlog#2647](https://github.com/rustfs/backlog/issues/2647).
