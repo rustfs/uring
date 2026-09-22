@@ -65,9 +65,12 @@ count permit, and Tokio's fair byte semaphore can put small reads behind a large
 waiter. Dropping a waiting handle returns all partial reservations. After enqueue,
 both permits travel with the read until its terminal CQE, even if its caller is
 canceled. Short-read retries retain the same reservation. A leaked read retains
-its charge. Shutdown closes the byte semaphore immediately; any shard-thread exit
-also closes it for the whole driver, conservatively rejecting further byte
-admission and waking byte waiters even on a bounded-drain escape.
+its charge. Shutdown or any shard-thread exit closes both the shared byte
+semaphore and every shard's count semaphore when byte limits are enabled.
+This rejects further admission and wakes waiters at either acquisition stage,
+even when another shard has a hung read or takes a bounded-drain escape.
+Registration and terminal closure are synchronized at startup/shutdown; ordinary
+read admission does not take a registry lock.
 
 This limits reserved driver read-buffer allocation bytes, **not process RSS**.
 It excludes queued handle/FD metadata, allocator overhead, result copies and
