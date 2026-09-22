@@ -25,6 +25,12 @@ aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Opt-in `ReadLimits` for logical read size and driver-wide in-flight read-buffer
+  bytes, with aligned allocation accounting and terminal-CQE ownership.
+- Opt-in capacity-aware shard selection for positioned reads; round-robin remains
+  the default and stream reads retain their routing semantics.
+- `ReadRequest`, `MAX_BATCH_READS` and `read_at_batch` for bounded buffered groups
+  sharing eager notifications per final owning shard.
 - Opt-in `diagnostics` feature with per-shard sampled driver-stage histograms,
   aggregate snapshots, and measurement-interval deltas. Default builds compile
   out the timing fields and sampling work.
@@ -33,6 +39,24 @@ aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   drift and environment gates, and bounded benchmark process-group cleanup.
 
 ### Changed
+
+- Bound driver intake, allocations and completion work per turn, preserving
+  progress after notification draining and partial successful submissions.
+- Stop explicitly canceled positioned-read continuations after read CQEs and
+  avoid materializing orphaned results without releasing kernel-owned resources.
+
+### Fixed
+
+- Progress empty-SQ CQ overflow/taskrun work and propagate metadata failures
+  instead of treating an unconfirmed direct-read short prefix as EOF.
+- Close count-stage and byte-stage waiters together when shared byte admission
+  shuts down; retain charged resources for bounded-drain bailout leaks.
+- Retry interrupted eventfd operations and suppress repeated unchanged overflow
+  warnings without changing the cumulative snapshot counter.
+- Reap the whole benchmark process group after wrapper failure, including when
+  the group leader exits before a child process.
+
+### Benchmarking
 
 - Benchmark CSV schema v2 obtains headers from the executable and reports
   independent setup, workload, and teardown timings, configurable ring depth,

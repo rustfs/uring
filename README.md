@@ -145,6 +145,8 @@ stage overlap, cancellation, and instrumentation-overhead boundaries.
 
 Benchmark configuration, CSV schema, timing boundaries, and performance gates
 are documented in [the benchmarking guide](docs/benchmarking.md).
+See [implementation and acceptance status](docs/optimization-status.md) for
+completed correctness work and the still-open performance/integration gates.
 
 Linux only; on other hosts `cargo check` builds the empty stub.
 
@@ -153,8 +155,8 @@ Linux only; on other hosts `cargo check` builds the empty stub.
 cargo test -- --nocapture --test-threads=1
 
 # Two legs in Docker (also on macOS via Docker Desktop / OrbStack):
-#   leg 1 — io_uring blocked by an explicit seccomp profile → every test MUST
-#           degrade to a graceful skip;
+#   leg 1 — io_uring blocked by an explicit seccomp profile → ring-dependent
+#           tests gracefully skip; kernel-independent unit tests still run;
 #   leg 2 — seccomp=unconfined → real io_uring, and NO test may skip.
 ./run-docker.sh
 ```

@@ -19,8 +19,10 @@ Tracking: [rustfs/backlog#2647](https://github.com/rustfs/backlog/issues/2647), 
   skips result memmove/truncation/materialization, including direct-I/O padding.
 - [x] Keep fd, buffer, and permit ownership until read completion and pending
   removal. AsyncCancel CQEs still only update cancel statistics.
-- [ ] Intake/reap budgets and wake coalescing (separate liveness work).
-- [ ] Native Linux execution of the new tests and the full regression suite.
+- [x] Bounded intake/reap and explicit finite-batch notifications (see
+  [driver fairness](driver-fairness.md) and [batch reads](batch-reads.md)).
+  No state-handshake/global wake coalescing is introduced.
+- [x] Native Linux execution of the new tests and the full regression suite.
 - [ ] Isolated before/after benchmark evidence; no measured speedup is claimed.
 
 ## Review and validation
@@ -35,12 +37,13 @@ unexpected errors. They do not depend on io_uring availability or accept a skip.
 
 Local `cargo fmt --all --check`, `git diff --check`, and Linux-target
 `cargo check` / `cargo clippy` with all targets and features passed. Cross-checks
-compile the Linux-only tests but do not execute them. Native execution remains
-an integration gate for this batch.
+compile the Linux-only tests but do not execute them. The combined hardening
+patch subsequently passed the full all-feature suite on unrestricted Linux,
+with no skipped tests and a mandatory positive O_DIRECT marker.
 
 Review confirms that no buffer is reclaimed at a cancel CQE or merely because
 the receiver closed. The optimization only observes cancellation at a read
 completion, with no live SQE writing into that buffer. A receiver closing after
 the final `is_closed` check may still incur a copy; this is an accepted race,
-not an ownership or correctness failure. Current direct-I/O `fstat` handling
-is unchanged and is tracked by the separate integrity work.
+not an ownership or correctness failure. Direct-I/O `fstat` error propagation
+is covered by the integrated [integrity work](fault-recovery.md).
