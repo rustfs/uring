@@ -19,9 +19,9 @@ use std::io::Write as _;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, TryRecvError};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -335,8 +335,8 @@ pub struct ReadLimits {
     /// completion, including canceled operations; leaked operations stay charged.
     /// Requests larger than this budget return `InvalidInput`, never wait.
     /// Zero and values above Tokio's `Semaphore::MAX_PERMITS` are invalid.
-    /// Shutdown or any shard exit closes byte admission for the entire driver
-    /// when enabled, waking byte waiters even if buffers must be leaked.
+    /// Shutdown or any shard exit closes count and byte admission for the entire
+    /// driver when enabled, waking all waiters even if buffers must be leaked.
     pub max_in_flight_bytes: Option<usize>,
 }
 
@@ -370,12 +370,63 @@ fn acquire_read_permits(count: Arc<Semaphore>, bytes: Option<Arc<Semaphore>>, ch
     })
 }
 
-struct CloseByteAdmission(Option<Arc<Semaphore>>);
+/// Registration and terminal closure happen only at startup/shutdown, never on
+/// read admission. The shared lock orders registration against shard failure.
+struct ByteAdmission {
+    bytes: Arc<Semaphore>,
+    registry: Mutex<AdmissionRegistry>,
+}
+
+#[derive(Default)]
+struct AdmissionRegistry {
+    closed: bool,
+    counts: Vec<Arc<Semaphore>>,
+}
+
+impl ByteAdmission {
+    fn new(bytes: usize) -> Self {
+        Self {
+            bytes: Arc::new(Semaphore::new(bytes)),
+            registry: Mutex::new(AdmissionRegistry::default()),
+        }
+    }
+
+    fn register(&self, count: &Arc<Semaphore>) {
+        let close = {
+            let mut registry = self.registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if registry.closed {
+                true
+            } else {
+                registry.counts.push(Arc::clone(count));
+                false
+            }
+        };
+        // Semaphore::close may run arbitrary task wakers. Never hold the
+        // registry lock across it, including registration after terminal close.
+        if close {
+            count.close();
+        }
+    }
+
+    fn close(&self) {
+        let counts = {
+            let mut registry = self.registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            registry.closed = true;
+            std::mem::take(&mut registry.counts)
+        };
+        self.bytes.close();
+        for count in counts {
+            count.close();
+        }
+    }
+}
+
+struct CloseByteAdmission(Option<Arc<ByteAdmission>>);
 
 impl Drop for CloseByteAdmission {
     fn drop(&mut self) {
-        if let Some(bytes) = &self.0 {
-            bytes.close();
+        if let Some(admission) = &self.0 {
+            admission.close();
         }
     }
 }
@@ -782,7 +833,7 @@ impl Drop for Shard {
 /// environments can fall back to a blocking backend before serving traffic.
 pub struct UringDriver {
     limits: ReadLimits,
-    byte_sem: Option<Arc<Semaphore>>,
+    byte_admission: Option<Arc<ByteAdmission>>,
     /// One or more independent rings. A cache-hit buffered read completes inline
     /// inside `io_uring_enter`, so the thread driving a ring performs that
     /// read's memcpy — which caps a single-ring driver at one core's memory
@@ -844,7 +895,7 @@ impl UringDriver {
                 "byte budget must be between 1 and Semaphore::MAX_PERMITS",
             )));
         }
-        let byte_sem = limits.max_in_flight_bytes.map(|bytes| Arc::new(Semaphore::new(bytes)));
+        let byte_admission = limits.max_in_flight_bytes.map(|bytes| Arc::new(ByteAdmission::new(bytes)));
         let mut started = Vec::with_capacity(shards.max(1));
         for i in 0..shards.max(1) {
             // Probe only the first shard (rustfs/backlog#1165): the probe read
@@ -853,11 +904,11 @@ impl UringDriver {
             // verify NODROP — this avoids `shards - 1` extra O_TMPFILE
             // create+write+read round-trips per disk on every start and renew.
             // `?` drops `started`, whose `Shard::drop` joins each running thread.
-            started.push(Self::start_shard(entries, i == 0, byte_sem.clone())?);
+            started.push(Self::start_shard(entries, i == 0, byte_admission.clone())?);
         }
         Ok(Self {
             limits,
-            byte_sem,
+            byte_admission,
             shards: started,
             next_id: AtomicU64::new(1),
             rr: AtomicUsize::new(0),
@@ -872,7 +923,7 @@ impl UringDriver {
         &self.shards[self.rr.fetch_add(1, Ordering::Relaxed) % n]
     }
 
-    fn start_shard(entries: u32, probe: bool, byte_sem: Option<Arc<Semaphore>>) -> Result<Shard, ProbeFailure> {
+    fn start_shard(entries: u32, probe: bool, byte_admission: Option<Arc<ByteAdmission>>) -> Result<Shard, ProbeFailure> {
         let mut ring = IoUring::new(entries).map_err(ProbeFailure::Setup)?;
         // Require the NODROP feature (kernel >= 5.5). Without it, CQ overflow
         // silently drops CQEs, stranding pending entries forever and hanging
@@ -915,6 +966,9 @@ impl UringDriver {
         // Cap in-flight at the SQ depth (entries), which is < CQ capacity
         // (2*entries), so CQ overflow is structurally unreachable (C5/C10).
         let sem = Arc::new(Semaphore::new(entries as usize));
+        if let Some(admission) = &byte_admission {
+            admission.register(&sem);
+        }
         let thread_sem = Arc::clone(&sem);
         // Deterministic spawn-failure seam (rustfs/backlog#1164): exercise the
         // degrade-not-panic path without a real cgroup pids-limit. Never present
@@ -933,7 +987,7 @@ impl UringDriver {
         let handle = std::thread::Builder::new()
             .name("uring-spike-driver".into())
             .spawn(move || {
-                let _close_bytes = CloseByteAdmission(byte_sem);
+                let _close_bytes = CloseByteAdmission(byte_admission);
                 drive(ring, rx, thread_stats, thread_sem, cq_efd, thread_wake);
             })
             .map_err(ProbeFailure::Setup)?;
@@ -1123,7 +1177,7 @@ impl UringDriver {
         // released only when the pending entry is dropped at the CQE (C10,
         // rustfs/backlog#1060). Acquisition never blocks the caller's thread
         // (rustfs/backlog#1102).
-        match try_read_permits(&shard.sem, self.byte_sem.as_ref(), charge) {
+        match try_read_permits(&shard.sem, self.byte_admission.as_ref().map(|admission| &admission.bytes), charge) {
             // Fast path: a permit was free, so submit eagerly — no allocation,
             // no await, and the op is in flight the moment `submit` returns,
             // exactly as with the previous blocking implementation.
@@ -1189,7 +1243,11 @@ impl UringDriver {
                 finished: false,
                 cancel_on_drop: true,
                 state: HandleState::WaitingPermit {
-                    acquire: acquire_read_permits(Arc::clone(&shard.sem), self.byte_sem.clone(), charge),
+                    acquire: acquire_read_permits(
+                        Arc::clone(&shard.sem),
+                        self.byte_admission.as_ref().map(|admission| Arc::clone(&admission.bytes)),
+                        charge,
+                    ),
                     file,
                     offset,
                     len,
@@ -1273,8 +1331,8 @@ impl UringDriver {
     /// Shards are asked to stop first and joined afterwards, so their bounded
     /// drains overlap instead of serializing `shards * DRAIN_TIMEOUT`.
     pub fn shutdown(mut self) -> StatsSnapshot {
-        if let Some(bytes) = &self.byte_sem {
-            bytes.close();
+        if let Some(admission) = &self.byte_admission {
+            admission.close();
         }
         for shard in &self.shards {
             let _ = shard.tx.send(Msg::Shutdown);
@@ -1301,8 +1359,8 @@ impl UringDriver {
 
 impl Drop for UringDriver {
     fn drop(&mut self) {
-        if let Some(bytes) = &self.byte_sem {
-            bytes.close();
+        if let Some(admission) = &self.byte_admission {
+            admission.close();
         }
         // Ask every shard to stop before joining any of them, so their bounded
         // drains overlap. Dropping the `Vec<Shard>` would instead run each
