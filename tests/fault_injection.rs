@@ -32,7 +32,7 @@ use std::os::unix::process::ExitStatusExt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use rustfs_uring::UringDriver;
+use rustfs_uring::{ReadLimits, UringDriver};
 
 /// A pipe whose read side blocks until the write side is written or closed — the
 /// only portable way to hold an op provably in flight.
@@ -245,6 +245,79 @@ fn stranded_handle_errors_after_bounded_drain_bailout() {
         Err(_) => panic!("stranded handle HUNG after bounded-drain bailout (rustfs/backlog#1161 regression)"),
     }
     drop(pipe_write);
+}
+
+/// #2647: exercise the real Pending ownership path with both admission stages
+/// waiting. This seam discards a real EOF/cancel CQE; it models a lost completion
+/// for bounded-drain testing, not an actual hung kernel read or storage device.
+#[test]
+fn byte_budget_bailout_leaks_pending_and_errors_both_admission_waiters() {
+    // SAFETY: this test binary is run with --test-threads=1. Configure the seam
+    // before driver creation; remove it only after every driver thread joins.
+    unsafe {
+        std::env::set_var("RUSTFS_URING_FAULT_STUCK_DRAIN", "1");
+        std::env::set_var("RUSTFS_URING_FAULT_DRAIN_TIMEOUT_MS", "400");
+    }
+    let driver = match UringDriver::probe_and_start_with_limits(
+        1,
+        2,
+        ReadLimits {
+            max_read_len: Some(8),
+            max_in_flight_bytes: Some(8),
+        },
+    ) {
+        Ok(driver) => driver,
+        Err(error) => {
+            clear_stuck_env();
+            assert!(error.is_expected_restriction(), "unexpected probe failure: {error}");
+            eprintln!("SKIP byte_budget_bailout: restricted environment ({error})");
+            return;
+        }
+    };
+
+    let (pipe_read, pipe_write) = os_pipe();
+    let leaked_file = Arc::downgrade(&pipe_read);
+    // Round-robin request 0 holds shard 0's sole count permit and all bytes.
+    let stranded = driver.read_current(Arc::clone(&pipe_read), 8).without_cancel_on_drop();
+    assert!(wait_until(Duration::from_secs(2), || driver.stats().in_flight == 1));
+    let waiting_file = Arc::new(File::open("/dev/zero").unwrap());
+    // Request 1 acquires shard 1's count but waits on shared bytes; request 2
+    // waits on shard 0's count before it can reach the byte semaphore.
+    let mut byte_waiter = driver.read_at(Arc::clone(&waiting_file), 0, 8);
+    let mut count_waiter = driver.read_at(waiting_file, 0, 8);
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    assert!(std::pin::Pin::new(&mut byte_waiter).poll(&mut cx).is_pending());
+    assert!(std::pin::Pin::new(&mut count_waiter).poll(&mut cx).is_pending());
+    assert_eq!(driver.stats().submitted, 1, "waiting reads must not allocate or submit");
+
+    // EOF makes the real pipe read finite. The seam deliberately suppresses its
+    // completion bookkeeping so the Pending and its reservations must be leaked.
+    drop(pipe_write);
+    drop(pipe_read);
+    let start = Instant::now();
+    let stats = driver.shutdown();
+    let elapsed = start.elapsed();
+    clear_stuck_env();
+    assert!(elapsed >= Duration::from_millis(300), "bailout path was not taken: {elapsed:?}");
+    assert!(elapsed < Duration::from_secs(3), "bounded drain exceeded its deadline: {elapsed:?}");
+    assert_eq!(stats.in_flight, 1, "Pending reservation must remain retained after bailout");
+    assert_eq!(stats.submitted, 1, "neither admission waiter may reach the driver");
+    assert_eq!(stats.delivered, 0, "discarded EOF CQE must not report successful delivery");
+
+    let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+    rt.block_on(async {
+        for (name, handle) in [
+            ("stranded", stranded),
+            ("byte-stage", byte_waiter),
+            ("count-stage", count_waiter),
+        ] {
+            let result = tokio::time::timeout(Duration::from_secs(2), handle).await;
+            assert!(matches!(result, Ok(Err(_))), "{name} handle must fail after bailout, got {result:?}");
+        }
+    });
+    // All caller references and handles are gone. This sole remaining strong
+    // reference belongs to the leaked Pending (whose ReadPermits stay with it).
+    assert_eq!(leaked_file.strong_count(), 1, "Pending's owned file must survive the bailout");
 }
 
 fn clear_stuck_env() {
