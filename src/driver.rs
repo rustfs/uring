@@ -116,6 +116,41 @@ const MAX_CONSECUTIVE_SUBMIT_ERRORS: u32 = 128;
 /// pathological storm cannot spin the driver thread (rustfs/backlog#1166).
 const MAX_TRANSIENT_RETRIES: u32 = 16;
 
+// Bound each phase so intake/allocation cannot indefinitely defer reap, and a
+// CQ burst cannot indefinitely defer cancel/shutdown intake. These are fairness
+// limits, not tuned throughput settings (rustfs/backlog#2647).
+const TURN_MESSAGES: usize = 64;
+const TURN_COMPLETIONS: usize = 64;
+const TURN_ALLOCATION_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(Default)]
+struct TurnBudget {
+    messages: usize,
+    completions: usize,
+    allocation_bytes: usize,
+}
+
+impl TurnBudget {
+    fn can_take_message(&self) -> bool {
+        self.messages < TURN_MESSAGES && self.allocation_bytes < TURN_ALLOCATION_BYTES
+    }
+
+    fn can_reap(&self) -> bool {
+        self.completions < TURN_COMPLETIONS
+    }
+
+    fn continue_without_wait(&self, ready_cqe: bool, queued_submission: bool, submitted: usize) -> bool {
+        // A hit budget can leave work behind after its eventfd edge was drained.
+        // One extra empty turn at an exact boundary is harmless. Merely having
+        // unaccepted SQEs must not spin after EBUSY, EINTR, errors or Ok(0).
+        !self.can_take_message() || !self.can_reap() || ready_cqe || (queued_submission && submitted > 0)
+    }
+}
+
+#[cfg(test)]
+#[path = "driver_loop_budget_tests.rs"]
+mod loop_budget_tests;
+
 /// Owned `eventfd(2)` used to wake the driver loop (backlog#1102): one is
 /// registered with the ring so the kernel signals it on every CQE, the other is
 /// signaled by `submit`/shutdown so a new message wakes the loop immediately —
@@ -1706,6 +1741,7 @@ mod fault_recovery_tests;
 /// when both submissions and kernel completion work are absent. EINTR/EBUSY are
 /// transient; any other errno is counted and, after a bounded run, transitions
 /// the shard to shutdown so callers fall back to the std backend.
+/// Returns the accepted SQE count, or zero when idle or submission failed.
 fn submit_ring(
     state: &mut DriverState,
     stats: &DriverStats,
@@ -1713,13 +1749,16 @@ fn submit_ring(
     submit_error_logged: &mut bool,
     shutting_down: &mut bool,
     queued_cancels: &mut HashSet<u64>,
-) {
+) -> usize {
     flush_backlog(&mut state.ring, &mut state.backlog);
     let Some(result) = submit_if_needed(&mut state.ring) else {
-        return;
+        return 0;
     };
     match result {
-        Ok(_) => *consecutive_submit_errors = 0,
+        Ok(submitted) => {
+            *consecutive_submit_errors = 0;
+            return submitted;
+        }
         // CQ-overflow backpressure (EBUSY) and signal interruption (EINTR) are
         // transient — retry next turn without counting them (C5, backlog#1056).
         Err(e) if matches!(e.raw_os_error(), Some(libc::EBUSY) | Some(libc::EINTR)) => *consecutive_submit_errors = 0,
@@ -1747,6 +1786,7 @@ fn submit_ring(
             }
         }
     }
+    0
 }
 
 fn drive(
@@ -1793,6 +1833,7 @@ fn drive(
     #[cfg(feature = "fault-injection")]
     let fault_stuck_drain = std::env::var_os("RUSTFS_URING_FAULT_STUCK_DRAIN").is_some();
 
+    let mut continue_without_wait = false;
     loop {
         // Block until a CQE is ready (the ring's registered eventfd), a new
         // message arrives (the wakeup eventfd), or the heartbeat elapses —
@@ -1810,13 +1851,16 @@ fn drive(
         } else {
             IDLE_HEARTBEAT
         };
-        wait_for_events(&cq_efd, &wake_efd, heartbeat);
+        if !continue_without_wait {
+            wait_for_events(&cq_efd, &wake_efd, heartbeat);
+        }
         cq_efd.drain();
         wake_efd.drain();
 
-        // 1. Intake: drain all queued messages (the wait above did the blocking,
-        //    so this is purely non-blocking).
-        loop {
+        let mut budget = TurnBudget::default();
+        // 1. Bounded intake. An individual large accepted read still makes
+        // progress; its allocation ends this phase rather than deferring forever.
+        while budget.can_take_message() {
             let msg = match rx.try_recv() {
                 Ok(m) => m,
                 Err(TryRecvError::Empty) => break,
@@ -1825,6 +1869,7 @@ fn drive(
                     break;
                 }
             };
+            budget.messages += 1;
             match msg {
                 Msg::Read {
                     id,
@@ -1868,6 +1913,7 @@ fn drive(
                         }
                     };
                     let buf = vec![0u8; cap];
+                    budget.allocation_bytes = budget.allocation_bytes.saturating_add(cap);
                     let pad = buf.as_ptr().align_offset(align);
                     // Runtime guard (not a debug-only assert): if the allocator
                     // ever returned a block `align_offset` cannot satisfy, refuse
@@ -1943,7 +1989,7 @@ fn drive(
 
         // 2. Flush the backlog into the SQ and submit it (the single submit path;
         //    see `submit_ring`).
-        submit_ring(
+        let submitted_before_reap = submit_ring(
             &mut state,
             &stats,
             &mut consecutive_submit_errors,
@@ -1955,7 +2001,12 @@ fn drive(
         // 3. Reap. A Pending entry (and thus its buffer) is dropped ONLY when
         //    the logical read finishes; a short read is resubmitted for the
         //    remainder and the entry stays put (C9, rustfs/backlog#1058).
-        while let Some(cqe) = state.ring.completion().next() {
+        while budget.can_reap() {
+            let Some(cqe) = state.ring.completion().next() else {
+                break;
+            };
+            // Count every consumed CQE, including cancels and test-only drops.
+            budget.completions += 1;
             let ud = cqe.user_data();
             if ud & CANCEL_BIT != 0 {
                 // Result of the AsyncCancel op itself; the read's own CQE
@@ -2039,7 +2090,7 @@ fn drive(
         // short-read continuations this turn. Two bounded attempts per loop
         // preserve heartbeat pacing on EBUSY/EINTR/zero-progress submission;
         // fully idle calls skip the syscall (rustfs/backlog#2647).
-        submit_ring(
+        let submitted_after_reap = submit_ring(
             &mut state,
             &stats,
             &mut consecutive_submit_errors,
@@ -2112,8 +2163,12 @@ fn drive(
                 return;
             }
         }
-        // No pacing sleep: `wait_for_events` at the top of the loop blocks until
-        // the next CQE, message, or heartbeat (backlog#1102).
+        let ready_cqe = !state.ring.completion().is_empty();
+        continue_without_wait = budget.continue_without_wait(
+            ready_cqe,
+            !state.backlog.is_empty() || !state.ring.submission().is_empty(),
+            submitted_before_reap.saturating_add(submitted_after_reap),
+        );
     }
 }
 
