@@ -25,6 +25,11 @@ aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Explicit same-binary A/A calibration mode for the evidence runner, including
+  individual middle-leg drift gates and no candidate attribution in control runs.
+- Example-only bounded ordered prefetch with deterministic backpressure,
+  cancellation and deferred-admission tests, plus a native CLI correctness gate.
+  This does not add a production streaming API or claim end-to-end speedups.
 - Opt-in `ReadLimits` for logical read size and driver-wide in-flight read-buffer
   bytes, with aligned allocation accounting and terminal-CQE ownership.
 - Opt-in capacity-aware shard selection for positioned reads; round-robin remains

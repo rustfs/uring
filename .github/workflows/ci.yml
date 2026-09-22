@@ -64,6 +64,8 @@ jobs:
             exit 1
           fi
           grep -q "DIRECT_OK direct_read_returns_exact_unaligned_ranges" test.out
+      - name: Ordered-prefetch contract smoke (real io_uring)
+        run: bash scripts/test-ordered-prefetch-cli.sh
       - name: Benchmark schema and correctness smoke
         run: bash scripts/test-benchmark-cli.sh
       - name: Instrumented benchmark schema and correctness smoke

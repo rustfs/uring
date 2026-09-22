@@ -147,6 +147,9 @@ Benchmark configuration, CSV schema, timing boundaries, and performance gates
 are documented in [the benchmarking guide](docs/benchmarking.md).
 See [implementation and acceptance status](docs/optimization-status.md) for
 completed correctness work and the still-open performance/integration gates.
+Application wiring has separate [RustFS integration prerequisites](docs/rustfs-integration.md).
+The [ordered-prefetch example](docs/ordered-prefetch.md) is a bounded consumer
+contract experiment, not a production streaming API or performance result.
 
 Linux only; on other hosts `cargo check` builds the empty stub.
 
