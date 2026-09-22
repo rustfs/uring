@@ -13,6 +13,9 @@
 // limitations under the License.
 
 #[cfg(target_os = "linux")]
+mod common;
+
+#[cfg(target_os = "linux")]
 #[path = "concurrent_pread_bench/linux.rs"]
 mod linux;
 

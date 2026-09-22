@@ -45,20 +45,25 @@ jobs:
   test:
     name: test (real io_uring on runner)
     runs-on: ubuntu-latest
+    env:
+      URING_REQUIRE_DIRECT: "1"
     steps:
       - uses: actions/checkout@v7
       - name: Install toolchain
         run: rustup toolchain install stable --profile minimal && rustup default stable
       - name: Build tests
-        run: cargo build --tests --all-features
+        run: cargo build --locked --tests --all-features
       - name: Test and assert io_uring actually ran
         run: |
           set -o pipefail
-          cargo test --all-features -- --nocapture --test-threads=1 2>&1 | tee test.out
+          cargo test --locked --all-features -- --nocapture --test-threads=1 2>&1 | tee test.out
           if grep -q "SKIP " test.out; then
             echo "::error::a test skipped — io_uring did not run on this runner (vacuous pass)"
             exit 1
           fi
+          grep -q "DIRECT_OK direct_read_returns_exact_unaligned_ranges" test.out
+      - name: Benchmark schema and correctness smoke
+        run: bash scripts/test-benchmark-cli.sh
 
   docker-two-legs:
     name: docker (degradation + real io_uring)

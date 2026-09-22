@@ -19,7 +19,7 @@
 # Sweeps strategy × read_size × concurrency. Caches are dropped before every
 # timed run so reads hit the device (a large file + random offsets means the
 # page cache would otherwise skew results run-to-run). Needs root for
-# drop_caches; the bench host azure-20780104 runs as root.
+# drop_caches; run cold sweeps only on an isolated test host.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -28,13 +28,14 @@ REPEAT="${REPEAT:-3}"
 BIN="${CARGO_TARGET_DIR:-target}/release/examples/concurrent_pread_bench"
 
 FILE_SIZE="${FILE_SIZE:-4294967296}" # 4 GiB, >> page cache reuse for random reads
-READ_SIZES=(${READ_SIZES:-65536 1048576})
-CONCURRENCIES=(${CONCURRENCIES:-1 8 32 128})
+read -r -a READ_SIZES <<<"${READ_SIZES:-65536 1048576}"
+read -r -a CONCURRENCIES <<<"${CONCURRENCIES:-1 8 32 128}"
+read -r -a SHARD_COUNTS <<<"${SHARD_COUNTS:-1}"
 # Bound each cold run's transfer instead of fixing the op count: a cold 1 MiB
 # read costs ~16x a 64 KiB one, so a fixed op count would make the large-read
 # legs dominate wall-clock for no extra signal.
 TOTAL_BYTES="${TOTAL_BYTES:-268435456}" # 256 MiB per run
-MIN_OPS="${MIN_OPS:-512}"               # enough samples for a p999
+MIN_OPS="${MIN_OPS:-512}"               # smoke-sized; not a reliable p999 population
 MAX_OPS="${MAX_OPS:-4096}"
 STRATS=(std_open_pread std_cached_pread uring_open_read uring_cached_read)
 
@@ -46,7 +47,7 @@ ops_for() { # read_size -> op count, clamped
 }
 
 mkdir -p "$DIR"
-cargo build --release --example concurrent_pread_bench >&2
+cargo build --locked --release --example concurrent_pread_bench >&2
 
 # Correctness preflight (untimed; output discarded). IOPS cannot distinguish a
 # strategy that reads the right *number* of bytes from one that reads the wrong
@@ -54,11 +55,9 @@ cargo build --release --example concurrent_pread_bench >&2
 # which checks each delivered byte against the file's offset-addressable pattern.
 # A mismatch aborts before any measurement is taken.
 preflight_verify() {
-    local vdir="$DIR/verify.$$" vfile strat
-    rm -rf "$vdir"
-    mkdir -p "$vdir"
-    # shellcheck disable=SC2064
-    trap "rm -rf '$vdir'" RETURN
+    local vdir vfile strat
+    vdir=$(mktemp -d "$DIR/verify.XXXXXX")
+    trap 'rm -rf -- "$vdir"; trap - RETURN' RETURN
     vfile="$vdir/verify.bin"
     for strat in "${STRATS[@]}"; do
         # Unaligned read size on purpose: exercises the offset bookkeeping.
@@ -72,24 +71,38 @@ FILE="$DIR/pread_${FILE_SIZE}.bin"
 # Create once, untimed, so every cold run below is genuinely cold.
 "$BIN" std_cached_pread "$FILE" "$FILE_SIZE" 65536 1 1 >/dev/null
 
-echo "cache,strategy,file_size,read_size,concurrency,ops,secs,IOPS,MBps,p50_us,p99_us,p999_us"
+HEADER=$("$BIN" --header)
+FIELDS=$(awk -F, '{print NF}' <<<"$HEADER")
+printf 'cache,%s\n' "$HEADER"
 for cache in ${CACHES:-cold warm}; do
+    if [[ "$cache" == cold && "${BENCH_WARMUP_OPS:-0}" != 0 ]]; then
+        echo "cold sweeps require BENCH_WARMUP_OPS=0" >&2
+        exit 1
+    fi
     for read_size in "${READ_SIZES[@]}"; do
         ops=$(ops_for "$read_size")
         for conc in "${CONCURRENCIES[@]}"; do
             for strat in "${STRATS[@]}"; do
-                for _ in $(seq 1 "$REPEAT"); do
-                    if [ "$cache" = cold ]; then
-                        sync
-                        echo 3 >/proc/sys/vm/drop_caches
-                    else
-                        # Warm takes the device out of the picture, isolating the
-                        # software cost (open, blocking-pool hop, submission).
-                        # On a throughput-throttled disk the cold leg saturates
-                        # and hides exactly the overhead we are pricing.
-                        cat "$FILE" >/dev/null
-                    fi
-                    echo "$cache,$("$BIN" "$strat" "$FILE" "$FILE_SIZE" "$read_size" "$conc" "$ops")"
+                shards_for_strategy=(1)
+                if [[ "$strat" == uring_* ]]; then
+                    shards_for_strategy=("${SHARD_COUNTS[@]}")
+                fi
+                for shards in "${shards_for_strategy[@]}"; do
+                    for _ in $(seq 1 "$REPEAT"); do
+                        if [ "$cache" = cold ]; then
+                            sync
+                            echo 3 >/proc/sys/vm/drop_caches
+                        else
+                            # Warm takes the device out of the picture, isolating the
+                            # software cost (open, blocking-pool hop, submission).
+                            # On a throughput-throttled disk the cold leg saturates
+                            # and hides exactly the overhead we are pricing.
+                            cat "$FILE" >/dev/null
+                        fi
+                        row=$("$BIN" "$strat" "$FILE" "$FILE_SIZE" "$read_size" "$conc" "$ops" "$shards")
+                        awk -F, -v expected="$FIELDS" 'NF != expected || $1 != 2 || $2 != "measure" {exit 1}' <<<"$row"
+                        printf '%s,%s\n' "$cache" "$row"
+                    done
                 done
             done
         done

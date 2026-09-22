@@ -45,7 +45,7 @@
 //! not a measurement, and its CSV row must be discarded.
 
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, Write};
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -53,9 +53,9 @@ use std::time::Instant;
 
 use rustfs_uring::UringDriver;
 
-/// Queue depth ceiling. `probe_and_start` gets `(qd * 2).next_power_of_two()`
-/// entries, so this keeps the ring under the kernel's 32768-entry limit and the
-/// arithmetic far from overflow.
+const CSV_HEADER: &str = "schema_version,mode,strategy,size,chunk,qd,align,bytes,secs,MBps,ops,startup_secs,shutdown_secs,workers,ring_entries,warmup_runs";
+
+/// Bound task fan-out independently of the configurable ring depth.
 const MAX_QD: usize = 4096;
 /// Smallest logical block size any device reports.
 const MIN_ALIGN: usize = 512;
@@ -107,6 +107,9 @@ struct Config {
     qd: usize,
     align: usize,
     verify: bool,
+    workers: usize,
+    ring_entries: u32,
+    warmup_runs: usize,
 }
 
 fn parse_usize(name: &str, raw: &str) -> Result<usize, String> {
@@ -127,6 +130,9 @@ fn parse_args() -> Result<Config, String> {
         qd: parse_usize("qd", &a[5])?,
         align: parse_usize("align", &a[6])?,
         verify: matches!(std::env::var("BENCH_VERIFY").as_deref(), Ok("1") | Ok("true")),
+        workers: crate::common::workers()?,
+        ring_entries: crate::common::ring_entries(128)?,
+        warmup_runs: crate::common::setting("BENCH_WARMUP_RUNS", 0, 0, 1000)?,
     };
     validate(&cfg)?;
     Ok(cfg)
@@ -269,12 +275,12 @@ fn open_read(cfg: &Config, direct: bool) -> io::Result<File> {
 // ---------------------------------------------------------------------------
 
 /// Sequential buffered read: the StdBackend baseline that rides kernel readahead.
-fn run_std_buffered(cfg: &Config) -> Result<(usize, usize), String> {
-    let mut f = open_read(cfg, false).map_err(|e| format!("open: {e}"))?;
-    let mut buf = vec![0u8; cfg.chunk];
+fn run_std_buffered(cfg: &Config, prepared: &mut Prepared) -> Result<(usize, usize), String> {
+    let mut f = prepared.file.as_ref();
+    let buf = &mut prepared.buf;
     let (mut total, mut ops) = (0usize, 0usize);
     loop {
-        let n = f.read(&mut buf).map_err(|e| format!("read: {e}"))?;
+        let n = f.read(buf).map_err(|e| format!("read: {e}"))?;
         if n == 0 {
             break;
         }
@@ -296,11 +302,11 @@ fn aligned_buf(len: usize, align: usize) -> (Vec<u8>, usize) {
 }
 
 /// Sequential O_DIRECT read: page-cache-bypassing baseline.
-fn run_std_odirect(cfg: &Config) -> Result<(usize, usize), String> {
-    let f = open_read(cfg, true).map_err(|e| format!("open O_DIRECT: {e}"))?;
+fn run_std_odirect(cfg: &Config, prepared: &mut Prepared) -> Result<(usize, usize), String> {
+    let f = prepared.file.as_ref();
     // `validate` already requires chunk % align == 0; this is the identity.
     let chunk = cfg.chunk;
-    let (mut buf, pad) = aligned_buf(chunk, cfg.align);
+    let (buf, pad) = (&mut prepared.buf, prepared.pad);
     let (mut total, mut ops, mut off) = (0usize, 0usize, 0u64);
     while (off as usize) < cfg.size {
         let n = f
@@ -322,16 +328,10 @@ fn run_std_odirect(cfg: &Config) -> Result<(usize, usize), String> {
 }
 
 /// Pipelined io_uring read at depth `qd`. `direct` selects read_at_direct.
-async fn run_uring(cfg: &Config, direct: bool) -> Result<(usize, usize), String> {
-    // `validate` caps qd at MAX_QD, so this cannot overflow u32.
-    let depth = (cfg.qd * 2).next_power_of_two() as u32;
-    let driver = Arc::new(UringDriver::probe_and_start(depth).map_err(|e| format!("probe io_uring: {e:?}"))?);
-    let file = Arc::new(open_read(cfg, direct).map_err(|e| format!("open: {e}"))?);
-
-    let offsets: Vec<(u64, usize)> = (0..cfg.size)
-        .step_by(cfg.chunk)
-        .map(|o| (o as u64, cfg.chunk.min(cfg.size - o)))
-        .collect();
+async fn run_uring(cfg: &Config, prepared: &Prepared, direct: bool) -> Result<(usize, usize), String> {
+    let driver = prepared.driver.as_ref().expect("uring strategy has a driver");
+    let file = &prepared.file;
+    let offsets = &prepared.offsets;
 
     let (mut total, mut ops) = (0usize, 0usize);
     let mut set = tokio::task::JoinSet::new();
@@ -376,28 +376,108 @@ async fn run_uring(cfg: &Config, direct: bool) -> Result<(usize, usize), String>
     Ok((total, ops))
 }
 
-fn run(cfg: &Config) -> Result<(usize, usize, f64), String> {
-    let start = Instant::now();
-    let (total, ops) = match cfg.strategy {
-        Strategy::StdBuffered => run_std_buffered(cfg)?,
-        Strategy::StdODirect => run_std_odirect(cfg)?,
+struct Prepared {
+    file: Arc<File>,
+    buf: Vec<u8>,
+    pad: usize,
+    driver: Option<Arc<UringDriver>>,
+    offsets: Vec<(u64, usize)>,
+}
+
+struct Measurement {
+    total: usize,
+    ops: usize,
+    secs: f64,
+    startup_secs: f64,
+    shutdown_secs: f64,
+}
+
+fn run_once(cfg: &Config, prepared: &mut Prepared, rt: Option<&tokio::runtime::Runtime>) -> Result<(usize, usize), String> {
+    match cfg.strategy {
+        Strategy::StdBuffered => run_std_buffered(cfg, prepared),
+        Strategy::StdODirect => run_std_odirect(cfg, prepared),
         Strategy::UringReadAt | Strategy::UringReadAtDirect => {
-            let direct = cfg.strategy == Strategy::UringReadAtDirect;
-            let rt = tokio::runtime::Builder::new_multi_thread()
+            rt.expect("uring strategy has a runtime")
+                .block_on(run_uring(cfg, prepared, cfg.strategy.is_direct()))
+        }
+    }
+}
+
+fn run(cfg: &Config) -> Result<Measurement, String> {
+    let startup = Instant::now();
+    let uses_uring = matches!(cfg.strategy, Strategy::UringReadAt | Strategy::UringReadAtDirect);
+    let rt = if uses_uring {
+        Some(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(cfg.workers)
                 .enable_all()
                 .build()
-                .map_err(|e| format!("runtime: {e}"))?;
-            rt.block_on(run_uring(cfg, direct))?
-        }
+                .map_err(|e| format!("runtime: {e}"))?,
+        )
+    } else {
+        None
     };
+    let file = Arc::new(open_read(cfg, cfg.strategy.is_direct()).map_err(|e| format!("open: {e}"))?);
+    let driver = if uses_uring {
+        Some(Arc::new(
+            UringDriver::probe_and_start(cfg.ring_entries).map_err(|e| format!("probe io_uring: {e:?}"))?,
+        ))
+    } else {
+        None
+    };
+    let (buf, pad) = match cfg.strategy {
+        Strategy::StdBuffered => (vec![0u8; cfg.chunk], 0),
+        Strategy::StdODirect => aligned_buf(cfg.chunk, cfg.align),
+        _ => (Vec::new(), 0),
+    };
+    let offsets = if uses_uring {
+        (0..cfg.size)
+            .step_by(cfg.chunk)
+            .map(|o| (o as u64, cfg.chunk.min(cfg.size - o)))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let mut prepared = Prepared {
+        file,
+        buf,
+        pad,
+        driver,
+        offsets,
+    };
+    let startup_secs = startup.elapsed().as_secs_f64();
+    for _ in 0..cfg.warmup_runs {
+        let (total, _) = run_once(cfg, &mut prepared, rt.as_ref())?;
+        if total != cfg.size {
+            return Err(format!("warmup read {total} of {} bytes", cfg.size));
+        }
+        // Reset the sequential baseline outside the next timed interval.
+        prepared.file.as_ref().rewind().map_err(|e| format!("rewind: {e}"))?;
+    }
+    let start = Instant::now();
+    let (total, ops) = run_once(cfg, &mut prepared, rt.as_ref())?;
     let secs = start.elapsed().as_secs_f64();
+    let shutdown = Instant::now();
+    drop(prepared);
+    drop(rt);
+    let shutdown_secs = shutdown.elapsed().as_secs_f64();
     if total != cfg.size {
         return Err(format!("strategy {} read {total} of {} bytes", cfg.strategy.name(), cfg.size));
     }
-    Ok((total, ops, secs))
+    Ok(Measurement {
+        total,
+        ops,
+        secs,
+        startup_secs,
+        shutdown_secs,
+    })
 }
 
 pub(super) fn main() -> ExitCode {
+    if std::env::args().nth(1).as_deref() == Some("--header") {
+        println!("{CSV_HEADER}");
+        return ExitCode::SUCCESS;
+    }
     let cfg = match parse_args().and_then(|cfg| ensure_file(&cfg.file, cfg.size).map(|()| cfg)) {
         Ok(cfg) => cfg,
         Err(e) => {
@@ -406,7 +486,13 @@ pub(super) fn main() -> ExitCode {
         }
     };
 
-    let (total, ops, secs) = match run(&cfg) {
+    let Measurement {
+        total,
+        ops,
+        secs,
+        startup_secs,
+        shutdown_secs,
+    } = match run(&cfg) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("streaming_bench: {e}");
@@ -425,9 +511,10 @@ pub(super) fn main() -> ExitCode {
         );
     }
     let mbps = (total as f64 / (1024.0 * 1024.0)) / secs;
-    // CSV: strategy,size,chunk,qd,align,bytes,secs,MBps,ops
+    let uses_uring = matches!(cfg.strategy, Strategy::UringReadAt | Strategy::UringReadAtDirect);
     println!(
-        "{},{},{},{},{},{},{:.6},{:.1},{}",
+        "2,{},{},{},{},{},{},{},{:.6},{:.1},{},{:.6},{:.6},{},{},{}",
+        if cfg.verify { "verify" } else { "measure" },
         cfg.strategy.name(),
         cfg.size,
         cfg.chunk,
@@ -436,7 +523,12 @@ pub(super) fn main() -> ExitCode {
         total,
         secs,
         mbps,
-        ops
+        ops,
+        startup_secs,
+        shutdown_secs,
+        if uses_uring { cfg.workers } else { 0 },
+        if uses_uring { cfg.ring_entries } else { 0 },
+        cfg.warmup_runs,
     );
     ExitCode::SUCCESS
 }

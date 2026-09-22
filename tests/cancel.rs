@@ -526,6 +526,11 @@ async fn direct_read_returns_exact_unaligned_ranges() {
     }
 
     let Some(file) = open_direct(&path) else {
+        assert_ne!(
+            std::env::var("URING_REQUIRE_DIRECT").as_deref(),
+            Ok("1"),
+            "O_DIRECT is required by this test lane, but the filesystem rejected it"
+        );
         // Not a skip of the io_uring paths — the suite still exercised them —
         // only the O_DIRECT assertions cannot run on this filesystem.
         eprintln!("direct_read_returns_exact_unaligned_ranges: filesystem rejects O_DIRECT, assertions not exercised");
@@ -558,6 +563,7 @@ async fn direct_read_returns_exact_unaligned_ranges() {
         .expect_err("non-power-of-two alignment must be rejected");
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "unexpected error: {err:?}");
 
+    eprintln!("DIRECT_OK direct_read_returns_exact_unaligned_ranges");
     driver.shutdown();
     let _ = std::fs::remove_file(&path);
 }
