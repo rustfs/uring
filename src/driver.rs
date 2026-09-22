@@ -369,7 +369,7 @@ type AcquireFut = Pin<Box<dyn Future<Output = Result<ReadPermits, tokio::sync::A
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ReadLimits {
     /// Maximum logical length of one read. `None` retains the kernel read cap.
-    /// A request exceeding this limit returns `InvalidInput` without allocation.
+    /// A request exceeding this limit returns `InvalidInput` without read-buffer allocation.
     pub max_read_len: Option<usize>,
     /// Maximum sum of reserved read-buffer bytes across all shards.
     ///

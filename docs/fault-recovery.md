@@ -7,8 +7,9 @@ the driver attempts submission again so newly freed CQ space can receive the
 kernel's NODROP overflow entries even when no new reads arrive.
 
 Each driver turn makes at most two submission attempts. Partial submission,
-zero progress, EINTR and EBUSY do not start an unbounded retry loop. The next
-event or heartbeat drives further progress. Pending buffers, file descriptors
+zero progress, EINTR and EBUSY do not start an unbounded retry loop. Positive
+partial progress with queued SQ work starts another bounded turn; errors and
+zero progress alone wait for the next event or heartbeat. Pending buffers, file descriptors
 and admission permits retain their existing final-CQE ownership rules.
 
 CQ-overflow warnings are emitted when the observed kernel counter changes to a

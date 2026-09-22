@@ -26,8 +26,10 @@ The existing active/idle heartbeats and two bounded submission attempts remain.
 An exact budget boundary with no actual remaining work costs one empty turn,
 after which normal idle waiting resumes.
 
-No wakeup coalescing or async-only eventfd registration is introduced. Messages
-arriving after the driver's queue check retain their eventfd notification; work
+Single-read producer notifications are not coalesced; explicit bounded groups
+can share notifications through [read_at_batch](batch-reads.md). No async-only
+eventfd registration is introduced. Messages arriving after the driver's queue
+check retain their eventfd notification; work
 left because of a budget retains the explicit continuation flag. Buffers, FDs
 and permits retain the existing final-CQE ownership rules.
 
