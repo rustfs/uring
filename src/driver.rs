@@ -838,6 +838,8 @@ impl UringDriver {
     /// just a (correct but pointless) buffered read of the superset range.
     /// Invalid alignment, range, or reserved-offset inputs are returned through
     /// the awaited result as `io::ErrorKind::InvalidInput`.
+    /// A non-aligned short read that does not cover the requested range succeeds
+    /// only when metadata confirms EOF; a failed metadata lookup returns an error.
     pub fn read_at_direct(&self, file: Arc<File>, offset: u64, len: usize, align: usize) -> ReadHandle {
         self.submit(file, offset, len, align, false)
     }
@@ -1347,13 +1349,15 @@ impl Drop for DriverState {
     }
 }
 
-/// Best-effort file length via `fstat` on the driver thread, used to tell a
-/// genuine O_DIRECT tail short read from a non-block-multiple short read that
-/// happened mid-file on a stacked filesystem (rustfs/backlog#1168). `None` when
-/// the stat fails, in which case the caller keeps the conservative EOF
-/// assumption rather than risk a wrong error or an unbounded resubmit loop.
-fn file_len(file: &File) -> Option<u64> {
-    file.metadata().ok().map(|m| m.len())
+/// Finish a non-aligned O_DIRECT short read only after confirming the file tail.
+/// Keeping the metadata result explicit lets tests inject errors without closing
+/// a live fd or changing process-wide environment state (rustfs/backlog#2647).
+fn finish_direct_short_read(p: &mut Pending, file_len: io::Result<u64>) -> io::Result<Vec<u8>> {
+    let file_len = file_len?;
+    if p.offset + (p.nread as u64) < file_len {
+        return Err(io::Error::other("io_uring O_DIRECT: non-block-aligned short read before EOF"));
+    }
+    Ok(deliver(p))
 }
 
 /// Hand the caller exactly the logical range `[head, head + want)` of the read
@@ -1410,10 +1414,25 @@ fn flush_backlog(ring: &mut IoUring, backlog: &mut VecDeque<io_uring::squeue::En
     }
 }
 
+/// An empty SQ is idle only when no kernel completion work needs an enter.
+/// io-uring 0.7.15 adds GETEVENTS in submit() for overflow/taskrun, even with no
+/// new SQEs. Bypassing that enter strands the kernel's NODROP overflow list.
+fn submit_if_needed(ring: &mut IoUring) -> Option<io::Result<usize>> {
+    let needs_enter = {
+        let sq = ring.submission();
+        !sq.is_empty() || sq.cq_overflow() || sq.taskrun()
+    };
+    needs_enter.then(|| ring.submit())
+}
+
+#[cfg(test)]
+#[path = "driver_fault_recovery_tests.rs"]
+mod fault_recovery_tests;
+
 /// Flush the backlog into the SQ and submit it, with submit-error classification
 /// (rustfs/backlog#1162). The single submit path for the whole loop: called once
-/// after intake and once more after reap when resubmits were queued. Skips the
-/// `io_uring_enter` syscall on an empty SQ (rustfs/backlog#1169). EINTR/EBUSY are
+/// after intake and once more after reap. Skips the `io_uring_enter` syscall only
+/// when both submissions and kernel completion work are absent. EINTR/EBUSY are
 /// transient; any other errno is counted and, after a bounded run, transitions
 /// the shard to shutdown so callers fall back to the std backend.
 fn submit_ring(
@@ -1425,19 +1444,19 @@ fn submit_ring(
     queued_cancels: &mut HashSet<u64>,
 ) {
     flush_backlog(&mut state.ring, &mut state.backlog);
-    if state.ring.submission().is_empty() {
+    let Some(result) = submit_if_needed(&mut state.ring) else {
         return;
-    }
-    match state.ring.submit() {
+    };
+    match result {
         Ok(_) => *consecutive_submit_errors = 0,
         // CQ-overflow backpressure (EBUSY) and signal interruption (EINTR) are
         // transient — retry next turn without counting them (C5, backlog#1056).
         Err(e) if matches!(e.raw_os_error(), Some(libc::EBUSY) | Some(libc::EINTR)) => *consecutive_submit_errors = 0,
         Err(e) => {
-            // The queued SQEs were not accepted, so their CQEs never arrive. A
-            // brief run may be transient (EAGAIN); a persistent one (e.g. EPERM
-            // from a seccomp/LSM policy applied after startup) must not be retried
-            // forever in silence.
+            // Submission or kernel completion progress failed. Do not infer
+            // per-op acceptance or reclaim buffers from this syscall error.
+            // A brief run may be transient (EAGAIN); a persistent one (e.g.
+            // EPERM from a later seccomp policy) must not retry forever silently.
             stats.submit_errors.fetch_add(1, Ordering::SeqCst);
             *consecutive_submit_errors += 1;
             if !*submit_error_logged {
@@ -1751,20 +1770,8 @@ fn drive(
                         // mid-file, and assuming EOF there would silently truncate
                         // the delivered range. Disambiguate with the actual file
                         // length instead of inferring it (rustfs/backlog#1168).
-                        match file_len(&p.file) {
-                            // Genuine tail: at or past EOF — deliver what we read.
-                            Some(len) if p.offset + p.nread as u64 >= len => ReapStep::Finish(Ok(deliver(p))),
-                            // Mid-file non-multiple: an O_DIRECT read cannot resubmit
-                            // from a non-block-aligned offset, so surface an error
-                            // rather than truncate. The integration falls back to
-                            // the std backend for this read, preserving correctness.
-                            Some(_) => ReapStep::Finish(Err(io::Error::other(
-                                "io_uring O_DIRECT: non-block-aligned short read before EOF",
-                            ))),
-                            // fstat failed: keep the conservative EOF assumption
-                            // rather than risk a wrong error or an infinite loop.
-                            None => ReapStep::Finish(Ok(deliver(p))),
-                        }
+                        let file_len = p.file.metadata().map(|metadata| metadata.len());
+                        ReapStep::Finish(finish_direct_short_read(p, file_len))
                     } else {
                         // Positioned short read, not EOF, block-aligned: resubmit
                         // the remainder into the read region. The buffer stays
@@ -1810,20 +1817,19 @@ fn drive(
             }
         }
 
-        // A short-read resubmit queued during reap must reach the kernel in THIS
-        // turn, not wait out the next heartbeat (rustfs/backlog#1163). Reap runs
-        // after the submit above, so re-run the single submit path when reap left
-        // work in the backlog; an idle turn leaves it empty and skips the call.
-        if !state.backlog.is_empty() {
-            submit_ring(
-                &mut state,
-                &stats,
-                &mut consecutive_submit_errors,
-                &mut submit_error_logged,
-                &mut shutting_down,
-                &mut queued_cancels,
-            );
-        }
+        // Reap freed CQ space: flush kernel overflow/task work even with an
+        // empty SQ/backlog. Also retry SQEs left by partial submission and submit
+        // short-read continuations this turn. Two bounded attempts per loop
+        // preserve heartbeat pacing on EBUSY/EINTR/zero-progress submission;
+        // fully idle calls skip the syscall (rustfs/backlog#2647).
+        submit_ring(
+            &mut state,
+            &stats,
+            &mut consecutive_submit_errors,
+            &mut submit_error_logged,
+            &mut shutting_down,
+            &mut queued_cancels,
+        );
 
         // Monitor CQ overflow. With NODROP (asserted at probe) overflowed CQEs
         // are BUFFERED in the kernel overflow list and flushed on the next enter,
