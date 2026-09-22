@@ -41,6 +41,8 @@ jobs:
         run: cargo fmt --check
       - name: clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: ABBA evidence gate tests
+        run: python3 -m unittest discover -s scripts -p 'test_bench_abba.py' -v
 
   test:
     name: test (real io_uring on runner)

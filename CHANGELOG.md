@@ -29,6 +29,8 @@ aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   aggregate snapshots, and measurement-interval deltas. Default builds compile
   out the timing fields and sampling work.
 - Native O_DIRECT execution gate and byte-exact benchmark CLI smoke coverage.
+- Warm-cache ABBA evidence runner with per-leg provenance/resource records,
+  drift and environment gates, and bounded benchmark process-group cleanup.
 
 ### Changed
 
