@@ -57,8 +57,9 @@ use std::time::{Duration, Instant};
 
 use rustfs_uring::UringDriver;
 
-/// Keeps `(concurrency * 2).next_power_of_two()` ring entries under the
-/// kernel's 32768-entry limit and the arithmetic far from overflow.
+const CSV_HEADER: &str = "schema_version,mode,strategy,shards,file_size,read_size,concurrency,ops,secs,IOPS,MBps,p50_us,p99_us,p999_us,startup_secs,shutdown_secs,workers,ring_entries,warmup_ops";
+
+/// Bound task fan-out independently of the configurable per-shard ring depth.
 const MAX_CONCURRENCY: usize = 4096;
 const MAX_READ_SIZE: usize = 1 << 30;
 
@@ -112,6 +113,9 @@ struct Config {
     total_ops: usize,
     shards: usize,
     verify: bool,
+    workers: usize,
+    ring_entries: u32,
+    warmup_ops: usize,
 }
 
 fn parse_args() -> Result<Config, String> {
@@ -135,6 +139,9 @@ fn parse_args() -> Result<Config, String> {
         total_ops: parse("total_ops", &a[6])? as usize,
         shards: if a.len() == 8 { parse("shards", &a[7])? as usize } else { 1 },
         verify: matches!(std::env::var("BENCH_VERIFY").as_deref(), Ok("1") | Ok("true")),
+        workers: crate::common::workers()?,
+        ring_entries: crate::common::ring_entries(128)?,
+        warmup_ops: crate::common::setting("BENCH_WARMUP_OPS", 0, 0, 10_000_000)?,
     };
     validate(&cfg)?;
     Ok(cfg)
@@ -161,6 +168,9 @@ fn validate(cfg: &Config) -> Result<(), String> {
     }
     if cfg.total_ops == 0 {
         return Err("total_ops must be > 0".to_string());
+    }
+    if cfg.shards == 0 || cfg.shards > 64 {
+        return Err("shards must be in 1..=64".to_string());
     }
     Ok(())
 }
@@ -261,10 +271,10 @@ fn open_read(path: &str) -> io::Result<File> {
 
 /// Deterministic block-aligned offsets, so every strategy reads the exact same
 /// blocks and the comparison is not confounded by a different access pattern.
-fn offsets(cfg: &Config) -> Vec<u64> {
+fn offsets(cfg: &Config, ops: usize) -> Vec<u64> {
     let blocks = (cfg.file_size - cfg.read_size as u64) / 4096;
     let mut state = 0x2545_f491_4f6c_dd1du64;
-    (0..cfg.total_ops)
+    (0..ops)
         .map(|_| {
             state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
             ((state >> 33) % blocks) * 4096
@@ -280,31 +290,51 @@ fn percentile(sorted: &[Duration], p: f64) -> u128 {
     sorted[idx].as_micros()
 }
 
-async fn run(cfg: &Config) -> Result<Vec<Duration>, String> {
-    let offs = Arc::new(offsets(cfg));
-    let path = Arc::new(cfg.file.clone());
+struct Prepared {
+    offsets: Arc<Vec<u64>>,
+    warmup_offsets: Arc<Vec<u64>>,
+    path: Arc<String>,
+    cached: Option<Arc<File>>,
+    driver: Option<Arc<UringDriver>>,
+}
 
-    // A shared fd is safe for the cached strategies: pread is positional and
-    // never touches the file description's shared offset.
-    let cached: Option<Arc<File>> = if cfg.strategy.uses_cached_fd() {
-        Some(Arc::new(open_read(&cfg.file).map_err(|e| format!("open cached fd: {e}"))?))
-    } else {
-        None
-    };
-    let driver = if cfg.strategy.uses_uring() {
-        let depth = (cfg.concurrency.max(64) * 2).next_power_of_two() as u32;
-        Some(Arc::new(
-            UringDriver::probe_and_start_sharded(depth, cfg.shards).map_err(|e| format!("probe io_uring: {e:?}"))?,
-        ))
-    } else {
-        None
-    };
+impl Prepared {
+    fn new(cfg: &Config) -> Result<Self, String> {
+        // Positional reads can share an fd without changing its current offset.
+        let cached = if cfg.strategy.uses_cached_fd() {
+            Some(Arc::new(open_read(&cfg.file).map_err(|e| format!("open cached fd: {e}"))?))
+        } else {
+            None
+        };
+        let driver = if cfg.strategy.uses_uring() {
+            Some(Arc::new(
+                UringDriver::probe_and_start_sharded(cfg.ring_entries, cfg.shards)
+                    .map_err(|e| format!("probe io_uring: {e:?}"))?,
+            ))
+        } else {
+            None
+        };
+        Ok(Self {
+            offsets: Arc::new(offsets(cfg, cfg.total_ops)),
+            warmup_offsets: Arc::new(offsets(cfg, cfg.warmup_ops)),
+            path: Arc::new(cfg.file.clone()),
+            cached,
+            driver,
+        })
+    }
+}
 
+async fn run(cfg: &Config, prepared: &Prepared, offs: &Arc<Vec<u64>>) -> Result<Vec<Duration>, String> {
     let (strategy, read_size, verify) = (cfg.strategy, cfg.read_size, cfg.verify);
-    let per_task = cfg.total_ops.div_ceil(cfg.concurrency);
+    let per_task = offs.len().div_ceil(cfg.concurrency);
     let mut set = tokio::task::JoinSet::new();
     for t in 0..cfg.concurrency {
-        let (offs, path, cached, driver) = (offs.clone(), path.clone(), cached.clone(), driver.clone());
+        let (offs, path, cached, driver) = (
+            Arc::clone(offs),
+            Arc::clone(&prepared.path),
+            prepared.cached.clone(),
+            prepared.driver.clone(),
+        );
         let start_idx = (t * per_task).min(offs.len());
         let end_idx = (start_idx + per_task).min(offs.len());
         set.spawn(async move {
@@ -312,7 +342,7 @@ async fn run(cfg: &Config) -> Result<Vec<Duration>, String> {
             for &off in &offs[start_idx..end_idx] {
                 let t0 = Instant::now();
                 let bytes: Vec<u8> = match strategy {
-                    // Today's StdBackend: a blocking-pool hop that opens then preads.
+                    // Mechanism baseline: one blocking hop for open plus pread.
                     Strategy::StdOpenPread => {
                         let p = path.clone();
                         tokio::task::spawn_blocking(move || {
@@ -337,7 +367,7 @@ async fn run(cfg: &Config) -> Result<Vec<Duration>, String> {
                         .map_err(|e| format!("join: {e}"))?
                         .map_err(|e| format!("pread: {e}"))?
                     }
-                    // Today's UringBackend: still a blocking-pool hop for open+stat.
+                    // Cache-miss shape: blocking open+stat, followed by io_uring.
                     Strategy::UringOpenRead => {
                         let p = path.clone();
                         let file = tokio::task::spawn_blocking(move || {
@@ -373,7 +403,7 @@ async fn run(cfg: &Config) -> Result<Vec<Duration>, String> {
         });
     }
 
-    let mut all = Vec::with_capacity(cfg.total_ops);
+    let mut all = Vec::with_capacity(offs.len());
     while let Some(r) = set.join_next().await {
         all.extend(r.map_err(|e| format!("task panicked: {e}"))??);
     }
@@ -381,6 +411,10 @@ async fn run(cfg: &Config) -> Result<Vec<Duration>, String> {
 }
 
 pub(super) fn main() -> ExitCode {
+    if std::env::args().nth(1).as_deref() == Some("--header") {
+        println!("{CSV_HEADER}");
+        return ExitCode::SUCCESS;
+    }
     let cfg = match parse_args() {
         Ok(cfg) => cfg,
         Err(e) => {
@@ -393,7 +427,12 @@ pub(super) fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+    let startup = Instant::now();
+    let rt = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(cfg.workers)
+        .enable_all()
+        .build()
+    {
         Ok(rt) => rt,
         Err(e) => {
             eprintln!("error: build runtime: {e}");
@@ -401,8 +440,23 @@ pub(super) fn main() -> ExitCode {
         }
     };
 
+    let prepared = match Prepared::new(&cfg) {
+        Ok(prepared) => prepared,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let startup_secs = startup.elapsed().as_secs_f64();
+    if cfg.warmup_ops != 0
+        && let Err(e) = rt.block_on(run(&cfg, &prepared, &prepared.warmup_offsets))
+    {
+        eprintln!("error: warmup: {e}");
+        return ExitCode::FAILURE;
+    }
+
     let start = Instant::now();
-    let mut lats = match rt.block_on(run(&cfg)) {
+    let mut lats = match rt.block_on(run(&cfg, &prepared, &prepared.offsets)) {
         Ok(l) => l,
         Err(e) => {
             eprintln!("error: {e}");
@@ -410,6 +464,12 @@ pub(super) fn main() -> ExitCode {
         }
     };
     let secs = start.elapsed().as_secs_f64();
+    // All operation tasks have joined. Drop the driver and runtime on this
+    // synchronous thread, outside the steady-state measurement.
+    let shutdown = Instant::now();
+    drop(prepared);
+    drop(rt);
+    let shutdown_secs = shutdown.elapsed().as_secs_f64();
 
     if cfg.verify {
         eprintln!("{}: verified byte-exact across {} reads", cfg.strategy.name(), lats.len());
@@ -419,11 +479,11 @@ pub(super) fn main() -> ExitCode {
     let ops = lats.len();
     let iops = ops as f64 / secs;
     let mbps = (ops as f64 * cfg.read_size as f64 / (1024.0 * 1024.0)) / secs;
-    // CSV: strategy,shards,file_size,read_size,concurrency,ops,secs,IOPS,MBps,p50_us,p99_us,p999_us
     println!(
-        "{},{},{},{},{},{},{:.6},{:.0},{:.1},{},{},{}",
+        "2,{},{},{},{},{},{},{},{:.6},{:.0},{:.1},{},{},{},{:.6},{:.6},{},{},{}",
+        if cfg.verify { "verify" } else { "measure" },
         cfg.strategy.name(),
-        cfg.shards,
+        if cfg.strategy.uses_uring() { cfg.shards } else { 0 },
         cfg.file_size,
         cfg.read_size,
         cfg.concurrency,
@@ -434,6 +494,11 @@ pub(super) fn main() -> ExitCode {
         percentile(&lats, 0.50),
         percentile(&lats, 0.99),
         percentile(&lats, 0.999),
+        startup_secs,
+        shutdown_secs,
+        cfg.workers,
+        if cfg.strategy.uses_uring() { cfg.ring_entries } else { 0 },
+        cfg.warmup_ops,
     );
     ExitCode::SUCCESS
 }

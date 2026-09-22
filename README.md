@@ -80,6 +80,9 @@ been reaped; `in_flight == 0` indicates a clean shutdown.
 
 ## Testing
 
+Benchmark configuration, CSV schema, timing boundaries, and performance gates
+are documented in [the benchmarking guide](docs/benchmarking.md).
+
 Linux only; on other hosts `cargo check` builds the empty stub.
 
 ```bash
