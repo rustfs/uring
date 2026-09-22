@@ -20,7 +20,7 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, TryRecvError};
 use std::task::{Context, Poll};
 use std::thread::JoinHandle;
@@ -122,6 +122,7 @@ const MAX_TRANSIENT_RETRIES: u32 = 16;
 /// together they replace the spike's 200 µs busy-poll.
 struct EventFd {
     fd: std::os::fd::RawFd,
+    error_logged: AtomicBool,
 }
 
 impl EventFd {
@@ -131,7 +132,10 @@ impl EventFd {
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok(Self { fd })
+        Ok(Self {
+            fd,
+            error_logged: AtomicBool::new(false),
+        })
     }
 
     fn as_raw(&self) -> std::os::fd::RawFd {
@@ -142,18 +146,53 @@ impl EventFd {
     /// already readable, which is all a wakeup needs.
     fn signal(&self) {
         let v: u64 = 1;
-        // SAFETY: writing 8 bytes from a valid u64 to an eventfd we own.
-        unsafe {
-            libc::write(self.fd, (&v as *const u64).cast(), 8);
-        }
+        self.transfer("signal", || {
+            // SAFETY: writing 8 bytes from a valid u64 to an eventfd we own.
+            unsafe { libc::write(self.fd, (&v as *const u64).cast(), 8) }
+        });
     }
 
     /// Reset the counter. EFD_NONBLOCK guarantees this never blocks; a single
-    /// successful read drains the whole counter, the next returns EAGAIN.
+    /// successful read drains the whole counter. A later concurrent signal is
+    /// left readable for the next turn; intake and CQ are checked after drain.
     fn drain(&self) {
         let mut v: u64 = 0;
-        // SAFETY: reading 8 bytes into a valid u64 from an eventfd we own.
-        while unsafe { libc::read(self.fd, (&mut v as *mut u64).cast(), 8) } == 8 {}
+        self.transfer("drain", || {
+            // SAFETY: reading 8 bytes into a valid u64 from an eventfd we own.
+            unsafe { libc::read(self.fd, (&mut v as *mut u64).cast(), 8) }
+        });
+    }
+
+    fn transfer(&self, operation: &'static str, mut syscall: impl FnMut() -> isize) {
+        let result = eventfd_transfer(|| {
+            let count = syscall();
+            if count < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(count as usize)
+            }
+        });
+        if let Err(error) = result
+            && !self.error_logged.swap(true, Ordering::Relaxed)
+        {
+            // At most one warning per fd, including shared producer wake fds.
+            // The heartbeat still checks queued work if a wake syscall fails.
+            tracing::warn!(operation, %error, "uring driver: eventfd operation failed; heartbeat remains active");
+        }
+    }
+}
+
+/// An eventfd transfer is all-or-nothing. Retry interrupted syscalls; EAGAIN
+/// means a signal is already pending (write) or no signal remains (read).
+fn eventfd_transfer(mut syscall: impl FnMut() -> io::Result<usize>) -> io::Result<()> {
+    loop {
+        match syscall() {
+            Ok(8) => return Ok(()),
+            Ok(_) => return Err(io::Error::other("eventfd transferred an unexpected byte count")),
+            Err(error) if error.raw_os_error() == Some(libc::EINTR) => continue,
+            Err(error) if error.raw_os_error() == Some(libc::EAGAIN) => return Ok(()),
+            Err(error) => return Err(error),
+        }
     }
 }
 
@@ -483,6 +522,9 @@ struct Pending {
     /// progress, bounded by `MAX_TRANSIENT_RETRIES` so a storm cannot spin the
     /// driver thread (rustfs/backlog#1166). Reset whenever a read makes progress.
     transient_retries: u32,
+    /// Explicit cancel intent, independent of receiver closure: opting out of
+    /// drop-cancel must still finish positioned reads after abandoning results.
+    cancel_requested: bool,
 }
 
 impl Pending {
@@ -1490,6 +1532,11 @@ fn finish_direct_short_read(p: &mut Pending, file_len: io::Result<u64>) -> io::R
 /// clamped to `nread`, so the zero-filled remainder of the buffer stays hidden
 /// (content hygiene, C12 / rustfs/backlog#1062).
 fn deliver(p: &mut Pending) -> Vec<u8> {
+    if p.done.as_ref().is_none_or(oneshot::Sender::is_closed) {
+        // Only called after the terminal read CQE. Keep the allocation in the
+        // entry for normal reclamation, avoiding an orphan's O_DIRECT memmove.
+        return Vec::new();
+    }
     let avail = p.nread.saturating_sub(p.head).min(p.want);
     let start = p.pad + p.head;
     // The buffered path (`align == 1`) has `pad == 0` and `head == 0`, so the
@@ -1508,6 +1555,52 @@ enum ReapStep {
     Finish(io::Result<Vec<u8>>),
     /// Short read, not EOF: re-queue this SQE for the remainder; keep the entry.
     Resubmit(io_uring::squeue::Entry),
+}
+
+/// Decide what follows a READ completion, never an AsyncCancel completion.
+/// Cancellation only suppresses continuation: an already-complete successful
+/// read still wins the race, and streams keep their read(2) short-read result.
+fn reap_read(p: &mut Pending, id: u64, res: i32, shutting_down: bool) -> ReapStep {
+    let stop_continuation = p.cancel_requested || shutting_down;
+    if res < 0 {
+        let err = -res;
+        let transient = err == libc::EINTR || err == libc::EAGAIN;
+        if transient && p.offset != CURRENT_POSITION && p.nread < p.region_len {
+            if stop_continuation {
+                return ReapStep::Finish(Err(io::Error::from_raw_os_error(libc::ECANCELED)));
+            }
+            if p.transient_retries < MAX_TRANSIENT_RETRIES {
+                p.transient_retries += 1;
+                return ReapStep::Resubmit(p.read_sqe(id));
+            }
+        }
+        return ReapStep::Finish(Err(io::Error::from_raw_os_error(err)));
+    }
+    if res == 0 {
+        return ReapStep::Finish(Ok(deliver(p)));
+    }
+    p.nread += res as usize;
+    // Progress resets the transient retry budget (rustfs/backlog#1166).
+    p.transient_retries = 0;
+    let is_stream = p.offset == CURRENT_POSITION;
+    let covered = p.nread >= p.head + p.want;
+    if is_stream || covered || p.nread >= p.region_len {
+        return ReapStep::Finish(Ok(deliver(p)));
+    }
+    if stop_continuation {
+        // This read SQE has completed, so reclamation is safe now. Do not start
+        // another positioned read for an explicitly cancelled logical request.
+        // Never report its incomplete prefix as successful whole-range output.
+        return ReapStep::Finish(Err(io::Error::from_raw_os_error(libc::ECANCELED)));
+    }
+    if p.align > 1 && !p.nread.is_multiple_of(p.align) {
+        // Disambiguate a genuine direct-I/O tail from a non-aligned short read
+        // before EOF; that offset cannot be resubmitted (rustfs/backlog#1168).
+        let file_len = p.file.metadata().map(|metadata| metadata.len());
+        ReapStep::Finish(finish_direct_short_read(p, file_len))
+    } else {
+        ReapStep::Resubmit(p.read_sqe(id))
+    }
 }
 
 /// Queue at most one `AsyncCancel` per op (rustfs/backlog#1167): a drop-cancel
@@ -1752,6 +1845,7 @@ fn drive(
                             region_len,
                             align,
                             transient_retries: 0,
+                            cancel_requested: false,
                         },
                     );
                     let sqe = state.pending.get(&id).expect("just inserted").read_sqe(id);
@@ -1764,7 +1858,8 @@ fn drive(
                     }
                 }
                 Msg::Cancel { id } => {
-                    if state.pending.contains_key(&id) {
+                    if let Some(pending) = state.pending.get_mut(&id) {
+                        pending.cancel_requested = true;
                         queue_cancel(&mut state.backlog, &mut queued_cancels, id);
                     }
                 }
@@ -1843,63 +1938,7 @@ fn drive(
             // the borrow ends (finish removes it; resubmit re-queues an SQE).
             let step = {
                 let p = state.pending.get_mut(&ud).expect("checked above");
-                if res < 0 {
-                    let err = -res;
-                    // C7 three-class contract (rustfs/backlog#1166): a transient
-                    // errno (EINTR/EAGAIN) must be retried, not surfaced as the
-                    // read's final result — surfacing it would also discard the
-                    // already-read prefix of a resubmit. Bounded per logical read
-                    // so a storm cannot spin the driver thread. Streams
-                    // (CURRENT_POSITION) cannot resubmit positionally; ECANCELED
-                    // and every other errno terminate the logical read.
-                    let transient = err == libc::EINTR || err == libc::EAGAIN;
-                    if transient
-                        && p.offset != CURRENT_POSITION
-                        && p.nread < p.region_len
-                        && p.transient_retries < MAX_TRANSIENT_RETRIES
-                    {
-                        p.transient_retries += 1;
-                        ReapStep::Resubmit(p.read_sqe(ud))
-                    } else {
-                        // Error (incl. ECANCELED, or a transient errno past its
-                        // retry budget) terminates the logical read.
-                        ReapStep::Finish(Err(io::Error::from_raw_os_error(err)))
-                    }
-                } else if res == 0 {
-                    // Real EOF: deliver whatever of the logical range was read.
-                    ReapStep::Finish(Ok(deliver(p)))
-                } else {
-                    p.nread += res as usize;
-                    // Progress resets the transient-retry budget (rustfs/backlog#1166).
-                    p.transient_retries = 0;
-                    // Only POSITIONED reads (read_at / read_at_direct, whole-range
-                    // pread contract) resubmit a short read. CURRENT_POSITION
-                    // reads (read_current on pipes/streams) follow read(2)
-                    // semantics: a short read is a valid final result and must be
-                    // delivered as-is — resubmitting would block forever waiting
-                    // for stream data that may never come.
-                    let is_stream = p.offset == CURRENT_POSITION;
-                    let covered = p.nread >= p.head + p.want;
-                    if is_stream || covered || p.nread >= p.region_len {
-                        ReapStep::Finish(Ok(deliver(p)))
-                    } else if p.align > 1 && !p.nread.is_multiple_of(p.align) {
-                        // O_DIRECT non-block-multiple short read below the covered
-                        // range. The kernel returns block multiples EXCEPT at the
-                        // file tail — but a stacked filesystem (NFS/FUSE, or a
-                        // signal-split direct I/O) can legally return a non-multiple
-                        // mid-file, and assuming EOF there would silently truncate
-                        // the delivered range. Disambiguate with the actual file
-                        // length instead of inferring it (rustfs/backlog#1168).
-                        let file_len = p.file.metadata().map(|metadata| metadata.len());
-                        ReapStep::Finish(finish_direct_short_read(p, file_len))
-                    } else {
-                        // Positioned short read, not EOF, block-aligned: resubmit
-                        // the remainder into the read region. The buffer stays
-                        // owned by the driver and in_flight is unchanged — one
-                        // logical op.
-                        ReapStep::Resubmit(p.read_sqe(ud))
-                    }
-                }
+                reap_read(p, ud, res, shutting_down)
             };
 
             #[cfg(feature = "diagnostics")]
@@ -2017,5 +2056,219 @@ fn drive(
         }
         // No pacing sleep: `wait_for_events` at the top of the loop blocks until
         // the next CQE, message, or heartbeat (backlog#1102).
+    }
+}
+
+#[cfg(test)]
+mod cancellation_efficiency_tests {
+    use super::*;
+
+    // No real I/O is submitted: completion decisions get deterministic short
+    // reads / errno results, so a naturally completed file cannot mask a retry.
+    fn pending() -> (Pending, oneshot::Receiver<io::Result<Vec<u8>>>, Arc<Semaphore>) {
+        let sem = Arc::new(Semaphore::new(1));
+        let (done, rx) = oneshot::channel();
+        let p = Pending {
+            #[cfg(feature = "diagnostics")]
+            timing: None,
+            buf: (0..16).collect(),
+            file: Arc::new(File::open("/dev/null").expect("open fixture fd")),
+            done: Some(done),
+            offset: 0,
+            nread: 0,
+            _permit: ReadPermits {
+                _count: Arc::clone(&sem).try_acquire_owned().expect("fixture permit"),
+                _bytes: None,
+            },
+            pad: 0,
+            head: 0,
+            want: 16,
+            region_len: 16,
+            align: 1,
+            transient_retries: 0,
+            cancel_requested: false,
+        };
+        (p, rx, sem)
+    }
+
+    fn assert_cancelled(step: ReapStep) {
+        match step {
+            ReapStep::Finish(Err(error)) => assert_eq!(error.raw_os_error(), Some(libc::ECANCELED)),
+            _ => panic!("cancelled positioned continuation must finish with ECANCELED"),
+        }
+    }
+
+    #[test]
+    fn explicit_cancel_stops_short_read_without_releasing_resources_early() {
+        let (mut p, _rx, sem) = pending();
+        let file = Arc::downgrade(&p.file);
+        let buffer = p.buf.as_ptr();
+        p.cancel_requested = true;
+        assert_eq!(sem.available_permits(), 0);
+        assert_cancelled(reap_read(&mut p, 1, 4, false));
+        assert_eq!(p.nread, 4);
+        assert_eq!(p.buf.as_ptr(), buffer);
+        assert_eq!(sem.available_permits(), 0);
+        assert!(file.upgrade().is_some());
+        drop(p);
+        assert_eq!(sem.available_permits(), 1);
+        assert!(file.upgrade().is_none());
+    }
+
+    #[test]
+    fn explicit_cancel_stops_both_transient_errno_retries() {
+        for errno in [libc::EINTR, libc::EAGAIN] {
+            let (mut p, _rx, _sem) = pending();
+            p.cancel_requested = true;
+            assert_cancelled(reap_read(&mut p, 1, -errno, false));
+            assert_eq!(p.transient_retries, 0);
+        }
+    }
+
+    #[test]
+    fn shutdown_stops_short_read_and_transient_continuations() {
+        for result in [4, -libc::EINTR, -libc::EAGAIN] {
+            let (mut p, _rx, _sem) = pending();
+            assert_cancelled(reap_read(&mut p, 1, result, true));
+        }
+    }
+
+    #[test]
+    fn closed_receiver_without_cancel_still_continues_positioned_reads() {
+        for result in [4, -libc::EINTR, -libc::EAGAIN] {
+            let (mut p, rx, sem) = pending();
+            drop(rx);
+            assert!(matches!(reap_read(&mut p, 1, result, false), ReapStep::Resubmit(_)));
+            assert_eq!(sem.available_permits(), 0);
+        }
+    }
+
+    #[test]
+    fn current_position_short_read_survives_cancel_and_shutdown_race() {
+        let (mut p, _rx, _sem) = pending();
+        p.offset = CURRENT_POSITION;
+        p.cancel_requested = true;
+        match reap_read(&mut p, 1, 4, true) {
+            ReapStep::Finish(Ok(bytes)) => assert_eq!(bytes, [0, 1, 2, 3]),
+            _ => panic!("stream short read must keep its read(2) result"),
+        }
+    }
+
+    #[test]
+    fn successful_complete_read_wins_cancel_race() {
+        let (mut p, _rx, _sem) = pending();
+        p.cancel_requested = true;
+        match reap_read(&mut p, 1, 16, true) {
+            ReapStep::Finish(Ok(bytes)) => assert_eq!(bytes, (0..16).collect::<Vec<_>>()),
+            _ => panic!("complete read must retain success"),
+        }
+    }
+
+    #[test]
+    fn eof_after_prefix_preserves_success_during_shutdown() {
+        let (mut p, _rx, _sem) = pending();
+        p.nread = 4;
+        p.cancel_requested = true;
+        match reap_read(&mut p, 1, 0, true) {
+            ReapStep::Finish(Ok(bytes)) => assert_eq!(bytes, [0, 1, 2, 3]),
+            _ => panic!("observed EOF must preserve the completed prefix"),
+        }
+    }
+
+    #[test]
+    fn transient_retry_keeps_prefix_and_exhausts_budget() {
+        let (mut p, _rx, sem) = pending();
+        p.nread = 4;
+        for _ in 0..MAX_TRANSIENT_RETRIES {
+            assert!(matches!(reap_read(&mut p, 1, -libc::EAGAIN, false), ReapStep::Resubmit(_)));
+            assert_eq!(p.nread, 4);
+            assert_eq!(sem.available_permits(), 0);
+        }
+        match reap_read(&mut p, 1, -libc::EAGAIN, false) {
+            ReapStep::Finish(Err(error)) => assert_eq!(error.raw_os_error(), Some(libc::EAGAIN)),
+            _ => panic!("transient retry budget must remain bounded"),
+        }
+    }
+
+    #[test]
+    fn current_position_transient_error_never_retries() {
+        let (mut p, _rx, _sem) = pending();
+        p.offset = CURRENT_POSITION;
+        p.cancel_requested = true;
+        match reap_read(&mut p, 1, -libc::EINTR, true) {
+            ReapStep::Finish(Err(error)) => assert_eq!(error.raw_os_error(), Some(libc::EINTR)),
+            _ => panic!("stream errors preserve read(2) semantics"),
+        }
+    }
+
+    #[test]
+    fn closed_receiver_skips_direct_result_copy_and_materialization() {
+        let (mut p, rx, _sem) = pending();
+        p.pad = 2;
+        p.head = 3;
+        p.want = 4;
+        p.region_len = 8;
+        p.align = 4;
+        let before = p.buf.clone();
+        let ptr = p.buf.as_ptr();
+        drop(rx);
+        match reap_read(&mut p, 1, 8, false) {
+            ReapStep::Finish(Ok(bytes)) => assert_eq!(bytes.capacity(), 0),
+            _ => panic!("terminal direct read must finish"),
+        }
+        assert_eq!(p.buf, before, "orphan result must not be memmoved or truncated");
+        assert_eq!(p.buf.as_ptr(), ptr);
+    }
+
+    #[test]
+    fn live_receiver_gets_exact_direct_result_range() {
+        let (mut p, _rx, _sem) = pending();
+        p.pad = 2;
+        p.head = 3;
+        p.want = 4;
+        p.region_len = 8;
+        p.align = 4;
+        match reap_read(&mut p, 1, 8, false) {
+            ReapStep::Finish(Ok(bytes)) => assert_eq!(bytes, [5, 6, 7, 8]),
+            _ => panic!("direct result must contain exactly the logical range"),
+        }
+    }
+
+    #[test]
+    fn eventfd_retries_interruption_until_transfer_or_would_block() {
+        for terminal in [Ok(8), Err(io::Error::from_raw_os_error(libc::EAGAIN))] {
+            let mut calls = [
+                Err(io::Error::from_raw_os_error(libc::EINTR)),
+                Err(io::Error::from_raw_os_error(libc::EINTR)),
+                terminal,
+            ]
+            .into_iter();
+            eventfd_transfer(|| calls.next().expect("unexpected retry")).expect("transfer or readiness satisfied");
+            assert!(calls.next().is_none());
+        }
+    }
+
+    #[test]
+    fn eventfd_propagates_unexpected_error_and_short_transfer() {
+        let error = eventfd_transfer(|| Err(io::Error::from_raw_os_error(libc::EBADF))).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EBADF));
+        assert!(eventfd_transfer(|| Ok(4)).is_err());
+    }
+
+    #[test]
+    fn saturated_eventfd_signal_keeps_readiness_and_drain_clears_it() {
+        let event = EventFd::new().expect("eventfd");
+        let value = u64::MAX - 1;
+        // SAFETY: event owns the fd; value is an initialized eight-byte counter.
+        assert_eq!(unsafe { libc::write(event.as_raw(), (&value as *const u64).cast(), 8) }, 8);
+        event.signal(); // EAGAIN: the already readable saturated fd is sufficient.
+        assert!(!event.error_logged.load(Ordering::Relaxed));
+        event.drain();
+        let mut read = 0_u64;
+        // SAFETY: event owns the fd; read is a valid eight-byte output buffer.
+        assert_eq!(unsafe { libc::read(event.as_raw(), (&mut read as *mut u64).cast(), 8) }, -1);
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EAGAIN));
+        event.drain(); // Empty EAGAIN is normal too.
+        assert!(!event.error_logged.load(Ordering::Relaxed));
     }
 }

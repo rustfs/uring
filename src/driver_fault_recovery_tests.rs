@@ -3,29 +3,35 @@
 
 use super::*;
 
-fn direct_prefix() -> Pending {
-    Pending {
+fn direct_prefix() -> (Pending, oneshot::Receiver<io::Result<Vec<u8>>>) {
+    let (done, receiver) = oneshot::channel();
+    let pending = Pending {
         #[cfg(feature = "diagnostics")]
         timing: None,
         // Simulated completed CQE: no kernel ever references this allocation.
         buf: vec![99, 10, 11, 12, 13, 14, 88, 88, 88],
         file: Arc::new(File::open("/dev/null").unwrap()),
-        done: None,
+        done: Some(done),
         offset: 4096,
         nread: 5,
-        _permit: Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap(),
+        _permit: ReadPermits {
+            _count: Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap(),
+            _bytes: None,
+        },
         pad: 1,
         head: 2,
         want: 6,
         region_len: 8,
         align: 4,
         transient_retries: 0,
-    }
+        cancel_requested: false,
+    };
+    (pending, receiver)
 }
 
 #[test]
 fn direct_metadata_failure_preserves_errno_without_delivering_prefix() {
-    let mut pending = direct_prefix();
+    let (mut pending, _receiver) = direct_prefix();
     let before = pending.buf.clone();
     let error = finish_direct_short_read(&mut pending, Err(io::Error::from_raw_os_error(libc::EIO))).unwrap_err();
     assert_eq!(error.raw_os_error(), Some(libc::EIO));
@@ -34,7 +40,7 @@ fn direct_metadata_failure_preserves_errno_without_delivering_prefix() {
 
 #[test]
 fn direct_mid_file_short_read_errors_without_delivering_prefix() {
-    let mut pending = direct_prefix();
+    let (mut pending, _receiver) = direct_prefix();
     let error = finish_direct_short_read(&mut pending, Ok(8192)).unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::Other);
     assert!(!pending.buf.is_empty());
@@ -42,20 +48,20 @@ fn direct_mid_file_short_read_errors_without_delivering_prefix() {
 
 #[test]
 fn direct_confirmed_tail_returns_only_initialized_logical_bytes() {
-    let mut pending = direct_prefix();
+    let (mut pending, _receiver) = direct_prefix();
     assert_eq!(finish_direct_short_read(&mut pending, Ok(4101)).unwrap(), [12, 13, 14]);
 }
 
 #[test]
 fn direct_concurrent_truncation_preserves_completed_prefix() {
-    let mut pending = direct_prefix();
+    let (mut pending, _receiver) = direct_prefix();
     // A truncate after the CQE does not erase bytes the read already completed.
     assert_eq!(finish_direct_short_read(&mut pending, Ok(4096)).unwrap(), [12, 13, 14]);
 }
 
 #[test]
 fn direct_eof_before_logical_start_returns_empty() {
-    let mut pending = direct_prefix();
+    let (mut pending, _receiver) = direct_prefix();
     pending.nread = 1;
     assert!(finish_direct_short_read(&mut pending, Ok(4097)).unwrap().is_empty());
 }
