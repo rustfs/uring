@@ -3,6 +3,8 @@
 import importlib.util
 import os
 from pathlib import Path
+import select
+import signal
 import sys
 import tempfile
 import unittest
@@ -77,6 +79,55 @@ class Gates(unittest.TestCase):
             pid = int(out.read_text().strip())
             with self.assertRaises(ProcessLookupError):
                 os.kill(pid, 0)
+
+    def test_failed_leader_does_not_leave_its_child_running(self):
+        # The child holds a FIFO writer open before allowing the leader to exit.
+        # EOF proves it exited without depending on orphan/zombie reaping timing.
+        child = """
+import os, sys, time
+print(os.getpid(), flush=True)
+ready_read, ready_write = os.pipe()
+if os.fork() == 0:
+    os.close(ready_read)
+    writer = os.open(sys.argv[1], os.O_WRONLY)
+    os.write(writer, b"ready")
+    os.write(ready_write, b"ready")
+    time.sleep(30)
+    os._exit(0)
+os.close(ready_write)
+os.read(ready_read, 5)
+os._exit(7)
+"""
+        with tempfile.TemporaryDirectory() as directory, patch.object(BENCH, "environment_guard"):
+            out = Path(directory) / "out"
+            err = Path(directory) / "err"
+            fifo = Path(directory) / "child-lifetime"
+            os.mkfifo(fifo)
+            reader = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+            try:
+                with self.assertRaisesRegex(RuntimeError, "exit code 7"):
+                    BENCH.execute([sys.executable, "-c", child, str(fifo)], os.environ.copy(), out, err, 5, None)
+                self.assertEqual(os.read(reader, 5), b"ready")
+                readable, _, _ = select.select([reader], [], [], 5)
+                self.assertEqual(readable, [reader], "benchmark descendant still holds the FIFO open")
+                self.assertEqual(os.read(reader, 1), b"")
+            finally:
+                os.close(reader)
+                # Also clean up when this regression is run against broken code.
+                if out.exists() and out.read_text().strip():
+                    try:
+                        os.killpg(int(out.read_text().strip()), signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
+    def test_missing_process_group_preserves_the_benchmark_failure(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(BENCH, "environment_guard"), \
+                patch.object(BENCH.os, "killpg", side_effect=ProcessLookupError) as killpg:
+            out = Path(directory) / "out"
+            err = Path(directory) / "err"
+            with self.assertRaisesRegex(RuntimeError, "exit code 7"):
+                BENCH.execute([sys.executable, "-c", "raise SystemExit(7)"], os.environ.copy(), out, err, 5, None)
+            killpg.assert_called_once()
 
 
 if __name__ == "__main__":
