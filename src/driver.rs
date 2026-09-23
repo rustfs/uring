@@ -112,6 +112,109 @@ const IDLE_HEARTBEAT: Duration = Duration::from_secs(1);
 /// default.
 const IOWQ_MAX_BOUNDED_WORKERS: u32 = 16;
 
+/// Startup result of one ring's best-effort io-wq worker-limit registration.
+///
+/// Registration success reports the limits that were in effect *before* the
+/// request. It does not report the resulting limit or the number of workers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IoWqSetup {
+    /// Requested `[bounded, unbounded]` workers per NUMA node. Zero leaves a
+    /// worker class unchanged; the driver currently requests `[16, 0]`.
+    pub requested: [u32; 2],
+    /// The registration result, captured during this shard's startup.
+    pub result: IoWqRegistration,
+}
+
+/// Outcome of one ring's best-effort io-wq worker-limit registration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IoWqRegistration {
+    /// The kernel accepted the request and returned the previous limits.
+    Registered {
+        /// `[bounded, unbounded]` limits before this registration call.
+        previous_limits: [u32; 2],
+    },
+    /// Registration failed; the driver continued to start normally.
+    Failed {
+        /// Standard I/O error category, including errors without an errno.
+        error_kind: io::ErrorKind,
+        /// Kernel errno when one was provided.
+        raw_os_error: Option<i32>,
+    },
+}
+
+fn register_iowq_setup(register: impl FnOnce(&mut [u32; 2]) -> io::Result<()>) -> IoWqSetup {
+    let requested = [IOWQ_MAX_BOUNDED_WORKERS, 0];
+    let mut limits = requested;
+    let result = match register(&mut limits) {
+        Ok(()) => IoWqRegistration::Registered { previous_limits: limits },
+        Err(error) => IoWqRegistration::Failed {
+            error_kind: error.kind(),
+            raw_os_error: error.raw_os_error(),
+        },
+    };
+    IoWqSetup { requested, result }
+}
+
+#[cfg(test)]
+fn mock_iowq_setup() -> IoWqSetup {
+    register_iowq_setup(|_| Err(io::Error::other("mock shard has no io-wq ring")))
+}
+
+#[cfg(test)]
+mod iowq_setup_tests {
+    use super::*;
+
+    #[test]
+    fn successful_registration_preserves_the_request_and_labels_kernel_output_as_previous() {
+        let mut calls = 0;
+        let setup = register_iowq_setup(|limits| {
+            calls += 1;
+            assert_eq!(*limits, [16, 0]);
+            *limits = [37, 5];
+            Ok(())
+        });
+        assert_eq!(calls, 1);
+        assert_eq!(setup.requested, [16, 0]);
+        assert_eq!(
+            setup.result,
+            IoWqRegistration::Registered {
+                previous_limits: [37, 5]
+            }
+        );
+    }
+
+    #[test]
+    fn failed_registration_records_errno_without_claiming_previous_limits() {
+        for errno in [libc::EINVAL, libc::EOPNOTSUPP, libc::EPERM] {
+            let setup = register_iowq_setup(|limits| {
+                assert_eq!(*limits, [16, 0]);
+                *limits = [91, 92]; // A failed call cannot supply valid previous limits.
+                Err(io::Error::from_raw_os_error(errno))
+            });
+            assert_eq!(setup.requested, [16, 0]);
+            assert_eq!(
+                setup.result,
+                IoWqRegistration::Failed {
+                    error_kind: io::Error::from_raw_os_error(errno).kind(),
+                    raw_os_error: Some(errno),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn failed_registration_without_errno_keeps_its_error_kind() {
+        let setup = register_iowq_setup(|_| Err(io::Error::other("registration unavailable")));
+        assert_eq!(
+            setup.result,
+            IoWqRegistration::Failed {
+                error_kind: io::ErrorKind::Other,
+                raw_os_error: None,
+            }
+        );
+    }
+}
+
 /// Consecutive non-transient `ring.submit()` failures the driver tolerates
 /// before it stops retrying silently and shuts the shard down, so callers get a
 /// driver-gone error and fall back to the std backend instead of stalling
@@ -980,6 +1083,7 @@ struct Shard {
     tx: mpsc::Sender<Msg>,
     handle: Option<JoinHandle<()>>,
     stats: Arc<DriverStats>,
+    iowq_setup: IoWqSetup,
     /// Backpressure permits (one per allowed in-flight op on this ring). Closed
     /// when the driver thread exits so any waiting `ReadHandle` resolves with a
     /// driver-gone error instead of hanging (rustfs/backlog#1102).
@@ -1263,8 +1367,7 @@ impl UringDriver {
         // TasksMax/RLIMIT_NPROC (rustfs/backlog#1169). Best-effort: 0 leaves the
         // unbounded pool unchanged, and a kernel without this op (< 5.15) keeps
         // the default — neither is fatal to a working ring.
-        let mut iowq_max = [IOWQ_MAX_BOUNDED_WORKERS, 0u32];
-        let _ = ring.submitter().register_iowq_max_workers(&mut iowq_max);
+        let iowq_setup = register_iowq_setup(|limits| ring.submitter().register_iowq_max_workers(limits));
 
         let wake_efd = Arc::new(EventFd::new().map_err(ProbeFailure::Setup)?);
         let thread_wake = Arc::clone(&wake_efd);
@@ -1305,6 +1408,7 @@ impl UringDriver {
             tx,
             handle: Some(handle),
             stats,
+            iowq_setup,
             sem,
             wake_efd,
         })
@@ -1649,6 +1753,16 @@ impl UringDriver {
                 }
             }
         }
+    }
+
+    /// Io-wq registration results captured when the shards started, in shard
+    /// order. Querying only copies stored data; it does not call the kernel.
+    ///
+    /// A successful registration reports the *previous* limits. Neither that
+    /// value nor the requested value proves the resulting worker count or a
+    /// process-wide thread cap. A failed registration does not disable reads.
+    pub fn shard_iowq_setup(&self) -> Vec<IoWqSetup> {
+        self.shards.iter().map(|shard| shard.iowq_setup).collect()
     }
 
     /// Counters summed across every shard. The conservation identities the
@@ -2625,6 +2739,7 @@ mod shared_budget_reservation_tests {
                     tx,
                     handle: None,
                     stats: Arc::new(DriverStats::default()),
+                    iowq_setup: mock_iowq_setup(),
                     sem,
                     wake_efd: Arc::new(EventFd::new().expect("mock wake fd")),
                 }],
@@ -2827,6 +2942,7 @@ mod shutdown_request_tests {
                     tx,
                     handle: None,
                     stats: Arc::new(DriverStats::default()),
+                    iowq_setup: mock_iowq_setup(),
                     sem,
                     wake_efd: Arc::new(EventFd::new().expect("mock wake fd")),
                 }

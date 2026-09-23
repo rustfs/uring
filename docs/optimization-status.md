@@ -8,13 +8,14 @@ integration are separate gates; a checked code item does not close the roadmap.
 | --- | --- | --- |
 | 1.1–1.4: benchmark schema, timing, diagnostics, direct positive gate | Merged in [#15](https://github.com/rustfs/uring/pull/15), CI passed | Diagnostics overhead and real LocalIoBackend baseline |
 | 1.5: ABBA evidence tooling | Explicit same-binary calibration implemented/reviewed; 20 gate/cleanup tests pass | Stable native calibration, valid comparison and application integration |
-| 2.1–2.4: completion recovery, direct integrity, byte admission, guarantee boundaries | Implemented and independently reviewed; native regression suite passed | PR merge; application-wide limits remain separate |
-| 2.4 API follow-up: shutdown control and runtime adapter | Implemented/reviewed; native CI #55 passed at `a942ac1` | PR merge; no hard cleanup deadline or performance claim |
-| 3.1–3.3: bounded turns, explicit batch notifications, cancellation efficiency | Implemented and independently reviewed; native regression suite passed | CPU/syscall and tail-latency comparison; PR merge |
-| 4.1: capacity-aware routing | Implemented and independently reviewed, opt-in; native tests passed | Controlled slow-shard/mixed-load performance; PR merge |
+| 2.1–2.4: completion recovery, direct integrity, byte admission, guarantee boundaries | Implemented/reviewed; native regression suite passed; #16 merged | Application-wide limits remain separate |
+| 2.4 API follow-up: shutdown control and runtime adapter | Implemented/reviewed; native CI #55 passed; #16 merged | No hard cleanup deadline or performance claim |
+| 3.1–3.3: bounded turns, explicit batch notifications, cancellation efficiency | Implemented/reviewed; native regression suite passed; #16 merged | CPU/syscall and tail-latency comparison |
+| 4.1: capacity-aware routing | Implemented/reviewed, opt-in; native tests passed; #16 merged | Controlled slow-shard/mixed-load performance |
 | 4.2: system-wide budgets and probe offload | Application probe offload, driver-thread budget and logical chunk limit implemented/reviewed in draft PRs #8072/#8074/#8076 | Full CI/merge; physical byte/result/io-wq budgets and [dependency wiring](rustfs-integration.md) remain open |
-| 4.2 pool prerequisite | Library whole-driver shared quota implemented/reviewed; native CI #57 passed at `b09b966` | Application dependency/fallback/result ownership wiring and merge |
-| 5: owned buffers and direct FD cache | Dual-mode exact invalidation implemented/reviewed in application draft PR #8075; direct caching and owned buffers not enabled | Full CI/merge, profile evidence, lease/pool lifetime and complete invalidation integration |
+| 4.2 pool prerequisite | Library whole-driver shared quota implemented/reviewed; native CI #57 passed; #16 merged | Application dependency/fallback/result ownership wiring |
+| 4.2 io-wq registration evidence | Per-shard startup query, deterministic and native tests implemented; two independent reviews passed | New-head native CI; actual worker count and process-wide budget remain unproven |
+| 5: owned buffers and direct FD cache | Dual-mode exact invalidation in application draft PR #8075 has passing CI; direct caching and owned buffers not enabled | PR merge, profile evidence, lease/pool lifetime and complete invalidation integration |
 | 6: ordered streaming prefetch | [Example-only contract experiment](ordered-prefetch.md) implemented/reviewed; 11 portable tests and native CLI CI #54 passed | Production consumer contract, bitrot/S3 and performance evidence |
 | 7: advanced ring/runtime modes | Not enabled or implemented | Earlier gates, capability/fallback and isolated benefit evidence |
 
@@ -37,6 +38,13 @@ follow-up commits need their own CI; the live PR and tracking issue record
 final-head CI and merge status separately.
 
 ## Follow-up evidence and examples
+
+The [io-wq startup record](iowq-startup.md) captures the existing registration
+result without changing its requested `[16, 0]` values, fallback, or read path.
+It records kernel-returned *previous* limits on success and error kind/errno on
+failure. Deterministic injected tests and a two-shard native test are added; a
+new-head native CI result remains pending; two independent reviews passed. The snapshot
+does not measure effective worker counts or establish a process-wide cap.
 
 `3931124` implements `SharedReadBudget` whole-driver reservations, with public
 tests in `7e94f36`. Seven deterministic private tests and nine public/native
@@ -136,6 +144,7 @@ establish stable calibration without loosening gates after observing results.
 - [Public read and admission contracts](../README.md)
 - [Shutdown ownership and Tokio adapter](shutdown.md)
 - [Shared whole-driver read-budget reservations](shared-read-budget.md)
+- [Io-wq startup registration evidence](iowq-startup.md)
 - [Completion recovery and direct integrity](fault-recovery.md)
 - [Cancellation and eventfd behavior](cancellation-efficiency.md)
 - [Driver turn fairness](driver-fairness.md)

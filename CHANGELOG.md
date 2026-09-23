@@ -25,6 +25,9 @@ aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Per-shard `shard_iowq_setup` startup snapshots of the existing best-effort
+  io-wq worker-limit registration, with requested values, previous limits on
+  success, and error classification on failure.
 - Opt-in `SharedReadBudget` whole-driver quota reservations, retained through
   deferred and kernel-owned reads, including bounded-drain leaks. Independent
   drivers keep independent admission and shutdown; default constructors are unchanged.
