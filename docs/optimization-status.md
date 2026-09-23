@@ -14,7 +14,7 @@ integration are separate gates; a checked code item does not close the roadmap.
 | 4.1: capacity-aware routing | Implemented/reviewed, opt-in; native tests passed; #16 merged | Controlled slow-shard/mixed-load performance |
 | 4.2: system-wide budgets and probe offload | Application probe offload, driver-thread budget and logical chunk limit implemented/reviewed in draft PRs #8072/#8074/#8076 | Full CI/merge; physical byte/result/io-wq budgets and [dependency wiring](rustfs-integration.md) remain open |
 | 4.2 pool prerequisite | Library whole-driver shared quota implemented/reviewed; native CI #57 passed; #16 merged | Application dependency/fallback/result ownership wiring |
-| 4.2 io-wq registration evidence | Per-shard startup query reviewed; [PR #17 CI](https://github.com/rustfs/uring/actions/runs/35808804770) passed at `193ab21` | PR merge; actual worker count and process-wide budget remain unproven |
+| 4.2 io-wq registration evidence | Per-shard startup query reviewed; both [PR #17 CI runs](https://github.com/rustfs/uring/actions/runs/35809115447) passed and #17 merged | Actual worker count and process-wide budget remain unproven |
 | 5: owned buffers and direct FD cache | Dual-mode exact invalidation in application draft PR #8075 has passing CI; direct caching and owned buffers not enabled | PR merge, profile evidence, lease/pool lifetime and complete invalidation integration |
 | 6: ordered streaming prefetch | [Example-only contract experiment](ordered-prefetch.md) implemented/reviewed; 11 portable tests and native CLI CI #54 passed | Production consumer contract, bitrot/S3 and performance evidence |
 | 7: advanced ring/runtime modes | Not enabled or implemented | Earlier gates, capability/fallback and isolated benefit evidence |
@@ -49,7 +49,7 @@ O_DIRECT marker, ordered-prefetch and both benchmark CLI smokes, and restricted/
 Docker coverage. The new native test read exact bytes from two shards and
 observed stable startup records; it did not force io-wq worker execution. The
 snapshot does not measure effective worker counts or establish a process-wide
-cap. A later documentation-only head has its own CI status.
+cap. The documentation-only head `2b79358` also passed [all three CI jobs](https://github.com/rustfs/uring/actions/runs/35809115447), and [#17](https://github.com/rustfs/uring/pull/17) merged as `fafd405d`.
 
 `3931124` implements `SharedReadBudget` whole-driver reservations, with public
 tests in `7e94f36`. Seven deterministic private tests and nine public/native
