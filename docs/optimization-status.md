@@ -12,10 +12,10 @@ integration are separate gates; a checked code item does not close the roadmap.
 | 2.4 API follow-up: shutdown control and runtime adapter | Implemented/reviewed; native CI #55 passed; #16 merged | No hard cleanup deadline or performance claim |
 | 3.1–3.3: bounded turns, explicit batch notifications, cancellation efficiency | Implemented/reviewed; native regression suite passed; #16 merged | CPU/syscall and tail-latency comparison |
 | 4.1: capacity-aware routing | Implemented/reviewed, opt-in; native tests passed; #16 merged | Controlled slow-shard/mixed-load performance |
-| 4.2: system-wide budgets and probe offload | Application probe offload, driver-thread budget and logical chunk limit implemented/reviewed in draft PRs #8072/#8074/#8076 | Full CI/merge; physical byte/result/io-wq budgets and [dependency wiring](rustfs-integration.md) remain open |
+| 4.2: system-wide budgets and probe offload | Application probe offload, driver-thread budget and logical chunk limit implemented/reviewed; #8080 merged into #8074, then #8074 into #8072 | #8072/#8076 final CI and application-main integration; physical byte/result/io-wq budgets remain open |
 | 4.2 pool prerequisite | Library whole-driver shared quota implemented/reviewed; native CI #57 passed; #16 merged | Application dependency/fallback/result ownership wiring |
 | 4.2 io-wq registration evidence | Per-shard startup query reviewed; both [PR #17 CI runs](https://github.com/rustfs/uring/actions/runs/35809115447) passed and #17 merged | Actual worker count and process-wide budget remain unproven |
-| 5: owned buffers and direct FD cache | Dual-mode exact invalidation in application draft PR #8075 has passing CI; direct caching and owned buffers not enabled | PR merge, profile evidence, lease/pool lifetime and complete invalidation integration |
+| 5: owned buffers and direct FD cache | Dual-mode exact invalidation is in open application PR #8075; a prior head passed CI, but direct caching and owned buffers are not enabled | Final-head CI/merge, profile evidence, lease/pool lifetime and complete invalidation integration |
 | 6: ordered streaming prefetch | [Example-only contract experiment](ordered-prefetch.md) implemented/reviewed; 11 portable tests and native CLI CI #54 passed | Production consumer contract, bitrot/S3 and performance evidence |
 | 7: advanced ring/runtime modes | Not enabled or implemented | Earlier gates, capability/fallback and isolated benefit evidence |
 
@@ -72,11 +72,15 @@ reservation costs. Application wiring and performance remain separate gates.
 
 Application work is tracked in [RustFS #8072](https://github.com/rustfs/rustfs/pull/8072),
 [#8074](https://github.com/rustfs/rustfs/pull/8074),
-[#8075](https://github.com/rustfs/rustfs/pull/8075), and
-[#8076](https://github.com/rustfs/rustfs/pull/8076), not merged into application
-main. The first two passed their native io_uring tests but failed workspace and
-full E2E gates respectively; the latter two still have checks running. These
-partial results do not establish successful application integration.
+[#8075](https://github.com/rustfs/rustfs/pull/8075),
+[#8076](https://github.com/rustfs/rustfs/pull/8076), and
+[#8080](https://github.com/rustfs/rustfs/pull/8080). #8080 merged into the #8074
+branch and #8074 merged into the #8072 branch; none of those changes reached
+application main. The open #8072, #8075 and #8076 PRs now target
+`improve/uring`, created at the then-current application main commit.
+#8076 still has failing full-CI jobs, while final-head checks on #8072 and #8075
+remain separate acceptance gates. These partial results do not establish
+successful application integration.
 
 `c7bb321` adds non-joining shutdown requests, advisory thread completion and the
 default-off Tokio shutdown adapter. Count and byte admission close before a
