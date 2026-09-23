@@ -20,6 +20,7 @@ fn driver(shard_count: usize, capacity: usize, bytes: Option<usize>) -> (UringDr
                 tx,
                 handle: None,
                 stats: Arc::new(DriverStats::default()),
+                iowq_setup: mock_iowq_setup(),
                 sem,
                 wake_efd: Arc::new(EventFd::new().unwrap()),
             }

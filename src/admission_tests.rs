@@ -187,6 +187,7 @@ fn fake_driver(limits: ReadLimits) -> (UringDriver, mpsc::Receiver<Msg>) {
                 tx,
                 handle: None,
                 stats: Arc::new(DriverStats::default()),
+                iowq_setup: mock_iowq_setup(),
                 sem: count,
                 wake_efd: Arc::new(EventFd::new().unwrap()),
             }],

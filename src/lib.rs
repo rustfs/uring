@@ -56,5 +56,6 @@ pub use diagnostics::{DIAGNOSTICS_SAMPLE_INTERVAL, DiagnosticsSnapshot, LatencyH
 
 #[cfg(target_os = "linux")]
 pub use driver::{
-    MAX_BATCH_READS, ProbeFailure, ReadHandle, ReadLimits, ReadRequest, ShardPolicy, SharedReadBudget, StatsSnapshot, UringDriver,
+    IoWqRegistration, IoWqSetup, MAX_BATCH_READS, ProbeFailure, ReadHandle, ReadLimits, ReadRequest, ShardPolicy,
+    SharedReadBudget, StatsSnapshot, UringDriver,
 };

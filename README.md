@@ -52,6 +52,7 @@ assert_eq!(snapshot.delivered + snapshot.orphan_reclaimed, snapshot.submitted);
 - `with_shard_policy(ShardPolicy::CapacityAware)` — opt-in capacity-aware routing for positioned reads. Constructors keep `ShardPolicy::RoundRobin` by default.
 - `request_shutdown()` — close admission and request cancellation/drain without joining; `is_finished()` reports advisory thread completion, not a clean drain.
 - `shutdown_async()` — with the default-off `tokio-runtime` feature, transfer consuming cleanup to Tokio's blocking pool at method call time. See [shutdown ownership and runtime boundaries](docs/shutdown.md).
+- `shard_iowq_setup()` — inspect each shard's best-effort startup registration request and result. Success returns the *previous* kernel limits; see [io-wq startup reporting](docs/iowq-startup.md).
 
 ### Shard selection
 
