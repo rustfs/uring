@@ -9,7 +9,7 @@ application integration**. The reviewed RustFS main revision is
 ## Current production boundary
 
 The application's [ecstore dependency](https://github.com/rustfs/rustfs/blob/1880b42169bf26b15d8ca6bea3d8f1e4203b1bad/crates/ecstore/Cargo.toml#L230)
-still uses registry `rustfs-uring = "0.2.2"`; it does not yet consume the new
+still uses registry `rustfs-uring = "0.3.0"`; it does not yet consume the new
 `ReadLimits`, batch or shard-policy APIs. The [local backend](https://github.com/rustfs/rustfs/blob/1880b42169bf26b15d8ca6bea3d8f1e4203b1bad/crates/ecstore/src/disk/local.rs#L1087)
 keeps io_uring opt-in, a depth of 128 per shard and a 128 MiB read chunk cap.
 Configured shard counts multiply across disks; driver-local limits are not a
