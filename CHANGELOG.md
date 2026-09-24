@@ -23,6 +23,8 @@ aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-24
+
 ### Added
 
 - Per-shard `shard_iowq_setup` startup snapshots of the existing best-effort
@@ -305,7 +307,8 @@ built. They are listed so nobody re-opens them without new evidence.
 [rustfs/backlog#1051]: https://github.com/rustfs/backlog/issues/1051
 [rustfs/backlog#1144]: https://github.com/rustfs/backlog/issues/1144
 [rustfs/backlog#1159]: https://github.com/rustfs/backlog/issues/1159
-[Unreleased]: https://github.com/rustfs/uring/compare/0.2.2...HEAD
+[Unreleased]: https://github.com/rustfs/uring/compare/0.3.0...HEAD
+[0.3.0]: https://github.com/rustfs/uring/compare/0.2.2...0.3.0
 [0.2.2]: https://github.com/rustfs/uring/compare/0.2.1...0.2.2
 [0.2.1]: https://github.com/rustfs/uring/compare/0.2.0...0.2.1
 [0.2.0]: https://github.com/rustfs/uring/compare/0.1.0...0.2.0
