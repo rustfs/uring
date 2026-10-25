@@ -46,6 +46,7 @@ fn pending_read(file: Arc<File>, count: &Arc<Semaphore>, bytes: &Arc<Semaphore>)
         done: None,
         offset: 0,
         nread: 0,
+        _owner: None,
         _permit: ReadPermits {
             _count: Arc::clone(count).try_acquire_owned().unwrap(),
             _bytes: Some(Arc::clone(bytes).try_acquire_many_owned(16).unwrap()),
