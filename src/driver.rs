@@ -580,7 +580,7 @@ impl SharedReadBudget {
         }
         self.inner
             .available
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |available| available.checked_sub(bytes))
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |available| available.checked_sub(bytes))
             .map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "shared read budget has insufficient unreserved capacity"))?;
         Ok(Arc::new(SharedReadReservation {
             pool: Arc::clone(&self.inner),
