@@ -54,6 +54,8 @@ assert_eq!(snapshot.delivered + snapshot.orphan_reclaimed, snapshot.submitted);
 - `shutdown_async()` — with the default-off `tokio-runtime` feature, transfer consuming cleanup to Tokio's blocking pool at method call time. See [shutdown ownership and runtime boundaries](docs/shutdown.md).
 - `shard_iowq_setup()` — inspect each shard's best-effort startup registration request and result. Success returns the *previous* kernel limits; see [io-wq startup reporting](docs/iowq-startup.md).
 
+Use `OwnedUringDriver<Owner>` when a read must retain a resource lease through native completion. Its `read_at_with_owner`, `read_at_direct_with_owner`, and `read_current_with_owner` methods move the owner through the existing queue and pending table without boxing or spawning a task. `Owner` must be `Send + Unpin + 'static`, and its destructor must not panic or block. Dropping a submitted handle or its runtime does not release the owner; final completion does. An unresolved bounded shutdown retains it with the leaked native operation. Returned bytes do not retain it. Existing `UringDriver` and `ReadHandle` are aliases for the unit-owner types, so existing constructors and `ReadRequest` literals remain unchanged.
+
 ### Shard selection
 
 Round-robin binds each read to the next shard, even if that shard is busy or

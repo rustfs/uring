@@ -580,7 +580,7 @@ impl SharedReadBudget {
         }
         self.inner
             .available
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |available| available.checked_sub(bytes))
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |available| available.checked_sub(bytes))
             .map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "shared read budget has insufficient unreserved capacity"))?;
         Ok(Arc::new(SharedReadReservation {
             pool: Arc::clone(&self.inner),
@@ -772,7 +772,7 @@ pub struct StatsSnapshot {
     pub submit_errors: u64,
 }
 
-enum Msg {
+enum Msg<O = ()> {
     Read {
         id: u64,
         #[cfg(feature = "diagnostics")]
@@ -786,6 +786,7 @@ enum Msg {
         /// (rustfs/backlog#1060/#1102). If the driver rejects the op (shutting
         /// down) the permit is dropped with the message — released immediately.
         permit: ReadPermits,
+        owner: Option<O>,
         /// Block size the read must be aligned to. `1` means a normal buffered
         /// read; `> 1` means the file was opened `O_DIRECT` and the driver must
         /// read the block-aligned superset range into a block-aligned buffer
@@ -833,7 +834,7 @@ enum Msg {
 ///   `buf[pad .. pad + region_len]` (both block-aligned) and hands the caller
 ///   only `buf[pad + head .. pad + head + want]` — alignment padding never
 ///   escapes.
-struct Pending {
+struct Pending<O = ()> {
     #[cfg(feature = "diagnostics")]
     timing: Option<Arc<Trace>>,
     buf: Vec<u8>,
@@ -845,6 +846,7 @@ struct Pending {
     /// Bytes already read into the read region (`buf[pad..]`).
     nread: usize,
     _permit: ReadPermits,
+    _owner: Option<O>,
     /// Offset inside `buf` where the block-aligned read region starts.
     pad: usize,
     /// Bytes of the read region that precede the caller's logical range.
@@ -864,7 +866,7 @@ struct Pending {
     cancel_requested: bool,
 }
 
-impl Pending {
+impl<O> Pending<O> {
     /// Build the read SQE for the not-yet-read remainder
     /// `[pad + nread, pad + region_len)` at file offset `offset + nread`. This is
     /// the single place a read SQE is constructed: the initial submit calls it
@@ -888,7 +890,7 @@ impl Pending {
 }
 
 /// Where a [`ReadHandle`] is in its lifecycle (rustfs/backlog#1102).
-enum HandleState {
+enum HandleState<O = ()> {
     /// Nothing was ever handed to the driver (a rejected parameter, or the
     /// driver was already gone). The result is already sitting in `rx`, and
     /// there is no buffer, permit, or SQE to reclaim.
@@ -899,6 +901,7 @@ enum HandleState {
     WaitingPermit {
         acquire: AcquireFut,
         file: Arc<File>,
+        owner: Option<O>,
         offset: u64,
         len: usize,
         align: usize,
@@ -927,19 +930,23 @@ enum HandleState {
 /// (the common case, unchanged from the blocking implementation). Only when the
 /// semaphore is saturated does the handle acquire the permit and submit on its
 /// first poll, so `submit` never blocks a runtime worker.
+pub type ReadHandle = OwnedReadHandle<()>;
+
+/// A read handle carrying a caller-supplied completion owner.
+/// The owner is not part of the returned buffer and is released at final completion.
 #[must_use = "a read handle must be awaited or explicitly dropped"]
-pub struct ReadHandle {
+pub struct OwnedReadHandle<O> {
     id: u64,
     #[cfg(feature = "diagnostics")]
     timing: Option<Arc<Trace>>,
     rx: oneshot::Receiver<io::Result<Vec<u8>>>,
-    tx: mpsc::Sender<Msg>,
+    tx: mpsc::Sender<Msg<O>>,
     finished: bool,
     cancel_on_drop: bool,
-    state: HandleState,
+    state: HandleState<O>,
 }
 
-impl ReadHandle {
+impl<O> OwnedReadHandle<O> {
     /// Keep the driver's buffer until the normal CQE even when this handle is
     /// dropped.
     ///
@@ -956,7 +963,7 @@ impl ReadHandle {
     }
 }
 
-impl Future for ReadHandle {
+impl<O: Unpin> Future for OwnedReadHandle<O> {
     type Output = io::Result<Vec<u8>>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -975,6 +982,7 @@ impl Future for ReadHandle {
         if let Some(res) = acquired {
             let Ok(permit) = res else {
                 // The semaphore was closed: the driver is gone.
+                this.state = HandleState::Inert;
                 this.finished = true;
                 return Poll::Ready(Err(io::Error::other("uring driver shut down")));
             };
@@ -987,6 +995,7 @@ impl Future for ReadHandle {
             };
             let HandleState::WaitingPermit {
                 file,
+                owner,
                 offset,
                 len,
                 align,
@@ -1012,6 +1021,7 @@ impl Future for ReadHandle {
                     len,
                     done,
                     permit,
+                    owner,
                     align,
                 })
                 .is_err()
@@ -1043,7 +1053,7 @@ impl Future for ReadHandle {
     }
 }
 
-impl Drop for ReadHandle {
+impl<O> Drop for OwnedReadHandle<O> {
     fn drop(&mut self) {
         // The buffer is deliberately NOT touched here: the driver owns it
         // until the CQE. All we may do is ask the kernel to hurry up. A handle
@@ -1079,8 +1089,8 @@ impl Drop for ReadHandle {
 /// dropped, and its bounded drain is what shutdown joins on. A `ReadHandle`
 /// carries the `tx` and `wake` of the shard that accepted it, so a cancel or a
 /// deferred submission always routes back to that same shard.
-struct Shard {
-    tx: mpsc::Sender<Msg>,
+struct Shard<O = ()> {
+    tx: mpsc::Sender<Msg<O>>,
     handle: Option<JoinHandle<()>>,
     stats: Arc<DriverStats>,
     iowq_setup: IoWqSetup,
@@ -1093,7 +1103,7 @@ struct Shard {
     wake_efd: Arc<EventFd>,
 }
 
-impl Shard {
+impl<O> Shard<O> {
     /// Ask the shard's thread to drain and exit, then join it. Idempotent: the
     /// `JoinHandle` is taken, so a later `Drop` is a no-op.
     fn join(&mut self) {
@@ -1105,7 +1115,7 @@ impl Shard {
     }
 }
 
-impl Drop for Shard {
+impl<O> Drop for Shard<O> {
     fn drop(&mut self) {
         self.join();
     }
@@ -1118,7 +1128,12 @@ impl Drop for Shard {
 /// that can be awaited or dropped without freeing memory still visible to the
 /// kernel. Construct it through [`UringDriver::probe_and_start`] so restricted
 /// environments can fall back to a blocking backend before serving traffic.
-pub struct UringDriver {
+pub type UringDriver = OwnedUringDriver<()>;
+
+/// A read driver that retains caller-supplied owners through native completion.
+/// Owners move through the existing queue and pending table without boxing or
+/// spawning a task. Use an owner that does not panic or block in its destructor.
+pub struct OwnedUringDriver<O> {
     limits: ReadLimits,
     shard_policy: ShardPolicy,
     byte_admission: Option<Arc<ByteAdmission>>,
@@ -1128,7 +1143,7 @@ pub struct UringDriver {
     /// bandwidth (~5 GB/s measured, rustfs/backlog#1145). Sharding lifts that
     /// ceiling roughly linearly while keeping the ring set per-disk, so a stalled
     /// disk still cannot starve another disk's rings (rustfs/backlog#1055).
-    shards: Vec<Shard>,
+    shards: Vec<Shard<O>>,
     next_id: AtomicU64,
     /// Round-robin cursor for shard selection. Relaxed: it only has to spread
     /// ops, never to order them.
@@ -1149,7 +1164,7 @@ pub struct ReadRequest {
     pub len: usize,
 }
 
-impl UringDriver {
+impl<O: Send + Unpin + 'static> OwnedUringDriver<O> {
     /// Create the ring AND verify a real `IORING_OP_READ` round-trip on a
     /// temp file before accepting work. `io_uring_setup` succeeding is not
     /// enough: gVisor/seccomp environments can create a ring whose ops then
@@ -1284,7 +1299,7 @@ impl UringDriver {
         start: usize,
         charge: u32,
         capacity_aware: bool,
-    ) -> (&Shard, Result<ReadPermits, TryAcquireError>) {
+    ) -> (&Shard<O>, Result<ReadPermits, TryAcquireError>) {
         let first = &self.shards[start];
         let bytes = self.byte_admission.as_ref().map(|admission| &admission.bytes);
         if !capacity_aware {
@@ -1331,12 +1346,12 @@ impl UringDriver {
     /// memcpy across driver threads; correctness does not depend on the choice,
     /// because the handle remembers which shard took the op.
     #[cfg(feature = "fault-injection")]
-    fn shard(&self) -> &Shard {
+    fn shard(&self) -> &Shard<O> {
         let n = self.shards.len();
         &self.shards[self.rr.fetch_add(1, Ordering::Relaxed) % n]
     }
 
-    fn start_shard(entries: u32, probe: bool, byte_admission: Option<Arc<ByteAdmission>>) -> Result<Shard, ProbeFailure> {
+    fn start_shard(entries: u32, probe: bool, byte_admission: Option<Arc<ByteAdmission>>) -> Result<Shard<O>, ProbeFailure> {
         let mut ring = IoUring::new(entries).map_err(ProbeFailure::Setup)?;
         // Require the NODROP feature (kernel >= 5.5). Without it, CQ overflow
         // silently drops CQEs, stranding pending entries forever and hanging
@@ -1419,8 +1434,8 @@ impl UringDriver {
     /// The offset must be at most `i64::MAX`; `u64::MAX` is reserved for
     /// [`Self::read_current`] and is returned as an asynchronous
     /// `io::ErrorKind::InvalidInput` result rather than panicking.
-    pub fn read_at(&self, file: Arc<File>, offset: u64, len: usize) -> ReadHandle {
-        self.submit(file, offset, len, 1, false, true)
+    pub fn read_at(&self, file: Arc<File>, offset: u64, len: usize) -> OwnedReadHandle<O> {
+        self.submit((file, None), offset, len, 1, false, true)
     }
 
     /// Create handles in input order for up to [`MAX_BATCH_READS`] buffered positioned reads.
@@ -1437,14 +1452,14 @@ impl UringDriver {
     /// More than [`MAX_BATCH_READS`] requests returns `InvalidInput` before any
     /// submission. Individual invalid requests return errors from their handles,
     /// exactly like [`Self::read_at`]; they do not reject other batch members.
-    pub fn read_at_batch(&self, requests: Vec<ReadRequest>) -> io::Result<Vec<ReadHandle>> {
+    pub fn read_at_batch(&self, requests: Vec<ReadRequest>) -> io::Result<Vec<OwnedReadHandle<O>>> {
         if requests.len() > MAX_BATCH_READS {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "read batch exceeds MAX_BATCH_READS"));
         }
         let mut handles = Vec::with_capacity(requests.len());
         let mut wakes: Vec<Arc<EventFd>> = Vec::with_capacity(requests.len());
         for ReadRequest { file, offset, len } in requests {
-            let handle = self.submit(file, offset, len, 1, false, false);
+            let handle = self.submit((file, None), offset, len, 1, false, false);
             if let HandleState::Submitted { wake } = &handle.state
                 && !wakes.iter().any(|queued| Arc::ptr_eq(queued, wake))
             {
@@ -1462,8 +1477,8 @@ impl UringDriver {
     }
 
     /// Read at the file's current position (read(2) semantics) — pipes.
-    pub fn read_current(&self, file: Arc<File>, len: usize) -> ReadHandle {
-        self.submit(file, CURRENT_POSITION, len, 1, true, true)
+    pub fn read_current(&self, file: Arc<File>, len: usize) -> OwnedReadHandle<O> {
+        self.submit((file, None), CURRENT_POSITION, len, 1, true, true)
     }
 
     /// Positioned read from a file opened with `O_DIRECT` (rustfs/backlog#1102).
@@ -1481,19 +1496,44 @@ impl UringDriver {
     /// the awaited result as `io::ErrorKind::InvalidInput`.
     /// A non-aligned short read that does not cover the requested range succeeds
     /// only when metadata confirms EOF; a failed metadata lookup returns an error.
-    pub fn read_at_direct(&self, file: Arc<File>, offset: u64, len: usize, align: usize) -> ReadHandle {
-        self.submit(file, offset, len, align, false, true)
+    pub fn read_at_direct(&self, file: Arc<File>, offset: u64, len: usize, align: usize) -> OwnedReadHandle<O> {
+        self.submit((file, None), offset, len, align, false, true)
     }
 
-    fn submit(
+    /// Buffered positioned read retaining `owner` until its final native completion.
+    /// Dropping the handle abandons only the result. An unsubmitted or rejected
+    /// read releases its owner normally; an unresolved shutdown retains it with
+    /// the leaked pending operation. The returned bytes never retain the owner.
+    pub fn read_at_with_owner(&self, file: Arc<File>, offset: u64, len: usize, owner: O) -> OwnedReadHandle<O> {
+        self.submit((file, Some(owner)), offset, len, 1, false, true)
+    }
+
+    /// Stream read with the same completion ownership as [`Self::read_at_with_owner`].
+    pub fn read_current_with_owner(&self, file: Arc<File>, len: usize, owner: O) -> OwnedReadHandle<O> {
+        self.submit((file, Some(owner)), CURRENT_POSITION, len, 1, true, true)
+    }
+
+    /// Direct positioned read with the same completion ownership as [`Self::read_at_with_owner`].
+    pub fn read_at_direct_with_owner(
         &self,
         file: Arc<File>,
         offset: u64,
         len: usize,
         align: usize,
+        owner: O,
+    ) -> OwnedReadHandle<O> {
+        self.submit((file, Some(owner)), offset, len, align, false, true)
+    }
+
+    fn submit(
+        &self,
+        (file, owner): (Arc<File>, Option<O>),
+        offset: u64,
+        len: usize,
+        align: usize,
         allow_current_position: bool,
         notify_now: bool,
-    ) -> ReadHandle {
+    ) -> OwnedReadHandle<O> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         assert_eq!(id & CANCEL_BIT, 0, "op id overflowed into the cancel bit");
         let (done, rx) = oneshot::channel();
@@ -1515,7 +1555,7 @@ impl UringDriver {
                 io::ErrorKind::InvalidInput,
                 "offset u64::MAX is reserved for read_current",
             )));
-            return ReadHandle {
+            return OwnedReadHandle {
                 id,
                 #[cfg(feature = "diagnostics")]
                 timing,
@@ -1539,7 +1579,7 @@ impl UringDriver {
                 io::ErrorKind::InvalidInput,
                 "offset exceeds i64::MAX (kernel loff_t is signed)",
             )));
-            return ReadHandle {
+            return OwnedReadHandle {
                 id,
                 #[cfg(feature = "diagnostics")]
                 timing,
@@ -1562,7 +1602,7 @@ impl UringDriver {
                 io::ErrorKind::InvalidInput,
                 "read length exceeds MAX_RW_COUNT or configured logical read limit; caller must chunk",
             )));
-            return ReadHandle {
+            return OwnedReadHandle {
                 id,
                 #[cfg(feature = "diagnostics")]
                 timing,
@@ -1601,7 +1641,7 @@ impl UringDriver {
                     io::ErrorKind::InvalidInput,
                     "alignment must be a power of two, and the block-aligned range must fit MAX_RW_COUNT and end within i64::MAX",
                 )));
-                return ReadHandle {
+                return OwnedReadHandle {
                     id,
                     #[cfg(feature = "diagnostics")]
                     timing,
@@ -1616,7 +1656,7 @@ impl UringDriver {
 
         if self.limits.max_in_flight_bytes.is_some_and(|max| allocation_bytes > max) {
             let _ = done.send(Err(io::Error::new(io::ErrorKind::InvalidInput, "aligned allocation exceeds byte budget")));
-            return ReadHandle {
+            return OwnedReadHandle {
                 id,
                 #[cfg(feature = "diagnostics")]
                 timing,
@@ -1672,6 +1712,7 @@ impl UringDriver {
                     len,
                     done,
                     permit,
+                    owner,
                     align,
                 }) {
                     // Driver gone: the op never reached it. Surface an explicit
@@ -1682,7 +1723,7 @@ impl UringDriver {
                     if let Msg::Read { done, .. } = msg {
                         let _ = done.send(Err(io::Error::other("uring driver shut down")));
                     }
-                    return ReadHandle {
+                    return OwnedReadHandle {
                         id,
                         #[cfg(feature = "diagnostics")]
                         timing,
@@ -1697,7 +1738,7 @@ impl UringDriver {
                 if notify_now {
                     shard.wake_efd.signal();
                 }
-                ReadHandle {
+                OwnedReadHandle {
                     id,
                     #[cfg(feature = "diagnostics")]
                     timing,
@@ -1713,7 +1754,7 @@ impl UringDriver {
             // Saturated: `entries` ops are already in flight. Do NOT block the
             // calling (runtime worker) thread — hand the acquire future to the
             // handle, which awaits it on its first poll and submits then.
-            Err(TryAcquireError::NoPermits) => ReadHandle {
+            Err(TryAcquireError::NoPermits) => OwnedReadHandle {
                 id,
                 #[cfg(feature = "diagnostics")]
                 timing,
@@ -1731,6 +1772,7 @@ impl UringDriver {
                             .and_then(|admission| admission.shared_reservation.clone()),
                     ),
                     file,
+                    owner,
                     offset,
                     len,
                     align,
@@ -1741,7 +1783,7 @@ impl UringDriver {
             // The driver has exited and closed the semaphore.
             Err(TryAcquireError::Closed) => {
                 let _ = done.send(Err(io::Error::other("uring driver shut down")));
-                ReadHandle {
+                OwnedReadHandle {
                     id,
                     #[cfg(feature = "diagnostics")]
                     timing,
@@ -1816,29 +1858,6 @@ impl UringDriver {
         shard.wake_efd.signal();
     }
 
-    /// Close admission and ask every shard to cancel/drain, without joining
-    /// driver threads or waiting for pending reads to complete.
-    ///
-    /// Count and byte waiters are woken with an admission error. An already
-    /// kernel-submitted operation still owns its buffer until its read CQE, or retains
-    /// it through the leak-over-UAF escape path. Concurrent and repeated calls
-    /// are safe; every call closes all admission before returning.
-    pub fn request_shutdown(&self) {
-        if let Some(admission) = &self.byte_admission {
-            admission.close();
-        }
-        // Also close count-only admission when byte limits are disabled. Do not
-        // use a once flag: a concurrent caller must not return before this work
-        // is complete merely because another caller started the request.
-        for shard in &self.shards {
-            shard.sem.close();
-        }
-        for shard in &self.shards {
-            let _ = shard.tx.send(Msg::Shutdown);
-            shard.wake_efd.signal();
-        }
-    }
-
     /// Advisory query: whether every driver thread's join handle reports
     /// finished (or has already been joined). This does not join threads or
     /// imply a clean drain; use [`Self::shutdown`] to join and inspect its stats.
@@ -1909,7 +1928,32 @@ impl UringDriver {
     }
 }
 
-impl Drop for UringDriver {
+impl<O> OwnedUringDriver<O> {
+    /// Close admission and ask every shard to cancel/drain, without joining
+    /// driver threads or waiting for pending reads to complete.
+    ///
+    /// Count and byte waiters are woken with an admission error. An already
+    /// kernel-submitted operation still owns its buffer until its read CQE, or retains
+    /// it through the leak-over-UAF escape path. Concurrent and repeated calls
+    /// are safe; every call closes all admission before returning.
+    pub fn request_shutdown(&self) {
+        if let Some(admission) = &self.byte_admission {
+            admission.close();
+        }
+        // Also close count-only admission when byte limits are disabled. Do not
+        // use a once flag: a concurrent caller must not return before this work
+        // is complete merely because another caller started the request.
+        for shard in &self.shards {
+            shard.sem.close();
+        }
+        for shard in &self.shards {
+            let _ = shard.tx.send(Msg::Shutdown);
+            shard.wake_efd.signal();
+        }
+    }
+}
+
+impl<O> Drop for OwnedUringDriver<O> {
     fn drop(&mut self) {
         // Ask every shard to stop before joining any of them, so their bounded
         // drains overlap. Dropping the `Vec<Shard>` would instead run each
@@ -2091,13 +2135,13 @@ fn drain_probe_cqe(ring: &mut IoUring) -> io::Result<i32> {
 /// destructors during an unwind: it aborts the process first, leaving the
 /// ring mapped and the buffers allocated (leak over UAF). A storage read path
 /// silently corrupting memory is worse than a crash.
-struct DriverState {
+struct DriverState<O = ()> {
     ring: IoUring,
-    pending: HashMap<u64, Pending>,
+    pending: HashMap<u64, Pending<O>>,
     backlog: VecDeque<io_uring::squeue::Entry>,
 }
 
-impl Drop for DriverState {
+impl<O> Drop for DriverState<O> {
     fn drop(&mut self) {
         if std::thread::panicking() {
             // Abort BEFORE any field destructor runs: the ring stays mapped
@@ -2118,7 +2162,7 @@ impl Drop for DriverState {
 /// Finish a non-aligned O_DIRECT short read only after confirming the file tail.
 /// Keeping the metadata result explicit lets tests inject errors without closing
 /// a live fd or changing process-wide environment state (rustfs/backlog#2647).
-fn finish_direct_short_read(p: &mut Pending, file_len: io::Result<u64>) -> io::Result<Vec<u8>> {
+fn finish_direct_short_read<O>(p: &mut Pending<O>, file_len: io::Result<u64>) -> io::Result<Vec<u8>> {
     let file_len = file_len?;
     if p.offset + (p.nread as u64) < file_len {
         return Err(io::Error::other("io_uring O_DIRECT: non-block-aligned short read before EOF"));
@@ -2135,7 +2179,7 @@ fn finish_direct_short_read(p: &mut Pending, file_len: io::Result<u64>) -> io::R
 /// corruption. Only bytes the kernel actually wrote are exposed: `avail` is
 /// clamped to `nread`, so the zero-filled remainder of the buffer stays hidden
 /// (content hygiene, C12 / rustfs/backlog#1062).
-fn deliver(p: &mut Pending) -> Vec<u8> {
+fn deliver<O>(p: &mut Pending<O>) -> Vec<u8> {
     if p.done.as_ref().is_none_or(oneshot::Sender::is_closed) {
         // Only called after the terminal read CQE. Keep the allocation in the
         // entry for normal reclamation, avoiding an orphan's O_DIRECT memmove.
@@ -2164,7 +2208,7 @@ enum ReapStep {
 /// Decide what follows a READ completion, never an AsyncCancel completion.
 /// Cancellation only suppresses continuation: an already-complete successful
 /// read still wins the race, and streams keep their read(2) short-read result.
-fn reap_read(p: &mut Pending, id: u64, res: i32, shutting_down: bool) -> ReapStep {
+fn reap_read<O>(p: &mut Pending<O>, id: u64, res: i32, shutting_down: bool) -> ReapStep {
     let stop_continuation = p.cancel_requested || shutting_down;
     if res < 0 {
         let err = -res;
@@ -2253,8 +2297,8 @@ mod fault_recovery_tests;
 /// transient; any other errno is counted and, after a bounded run, transitions
 /// the shard to shutdown so callers fall back to the std backend.
 /// Returns the accepted SQE count, or zero when idle or submission failed.
-fn submit_ring(
-    state: &mut DriverState,
+fn submit_ring<O>(
+    state: &mut DriverState<O>,
     stats: &DriverStats,
     consecutive_submit_errors: &mut u32,
     submit_error_logged: &mut bool,
@@ -2333,9 +2377,9 @@ fn update_cq_overflow(stats: &DriverStats, previous: &mut u32, observed: u32) ->
     observed != 0
 }
 
-fn drive(
+fn drive<O>(
     ring: IoUring,
-    rx: mpsc::Receiver<Msg>,
+    rx: mpsc::Receiver<Msg<O>>,
     stats: Arc<DriverStats>,
     sem: Arc<Semaphore>,
     cq_efd: EventFd,
@@ -2425,6 +2469,7 @@ fn drive(
                     len,
                     done,
                     permit,
+                    owner,
                     align,
                 } => {
                     if shutting_down {
@@ -2488,6 +2533,7 @@ fn drive(
                             // Released exactly when this entry is removed at the
                             // final CQE — never at future drop (backlog#1060).
                             _permit: permit,
+                            _owner: owner,
                             pad,
                             head,
                             want: len,
@@ -3129,6 +3175,7 @@ mod cancellation_efficiency_tests {
             done: Some(done),
             offset: 0,
             nread: 0,
+            _owner: None,
             _permit: ReadPermits {
                 _count: Arc::clone(&sem).try_acquire_owned().expect("fixture permit"),
                 _bytes: None,
